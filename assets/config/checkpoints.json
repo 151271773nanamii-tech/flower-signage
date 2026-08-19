@@ -1,0 +1,30 @@
+[
+  {
+    "id": "checkpoint_001",
+    "name": "図書館",
+    "addresses": [
+      "38:56:10:00:64:EB",
+      "B0:E9:FE:57:E1:C0",
+      "F4:4E:FD:CA:2A:16",
+      "F4:4E:FD:D1:98:8F",
+      "AA:BB:CC:11:22:01",
+      "AA:BB:CC:11:22:02",
+      "AA:BB:CC:11:22:03",
+      "AA:BB:CC:11:22:04"
+    ],
+    "required_ratio": 0.5,
+    "flower": "tulip"
+  },
+  {
+    "id": "checkpoint_002",
+    "name": "公民館",
+    "addresses": [
+      "AA:BB:CC:11:22:01",
+      "AA:BB:CC:11:22:02",
+      "AA:BB:CC:11:22:03",
+      "AA:BB:CC:11:22:04"
+    ],
+    "required_ratio": 0.5,
+    "flower": "sunflower"
+  }
+]
