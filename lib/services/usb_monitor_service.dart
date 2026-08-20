@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
+import 'tag_serial_service.dart';
+
 class UsbMonitorService {
   UsbMonitorService({
     required this.onTagConnected,
@@ -11,25 +13,52 @@ class UsbMonitorService {
     this.disconnectMissThreshold = 3,
   });
 
-  final void Function(String folderPath) onTagConnected;
-  final void Function() onTagDisconnected;
+  final void Function(String folderPath)
+      onTagConnected;
+
+  final void Function()
+      onTagDisconnected;
 
   final Duration interval;
+
   final int disconnectMissThreshold;
 
   Timer? _timer;
 
+  // ============================================================
+  // 現在接続中のStorage
+  // ============================================================
+
   String? _currentTagPath;
+
+  // ============================================================
+  // UARTから取得したMAC
+  // ============================================================
+
+  String? _currentTagMac;
+
+  // ============================================================
+  // 処理中フラグ
+  // ============================================================
 
   bool _checking = false;
 
+  bool _switchingToStorage = false;
+
   int _mountMissCount = 0;
+
+  // ============================================================
+  // Getter
+  // ============================================================
 
   bool get isConnected =>
       _currentTagPath != null;
 
   String? get currentTagPath =>
       _currentTagPath;
+
+  String? get currentTagMac =>
+      _currentTagMac;
 
   // ============================================================
   // START
@@ -43,6 +72,9 @@ class UsbMonitorService {
     _timer?.cancel();
 
     _checking = false;
+
+    _switchingToStorage = false;
+
     _mountMissCount = 0;
 
     _check();
@@ -63,9 +95,13 @@ class UsbMonitorService {
     );
 
     _timer?.cancel();
+
     _timer = null;
 
     _checking = false;
+
+    _switchingToStorage = false;
+
     _mountMissCount = 0;
   }
 
@@ -82,7 +118,7 @@ class UsbMonitorService {
 
     try {
       // ========================================================
-      // すでに接続済み
+      // すでにStorageとして接続済み
       // ========================================================
 
       if (_currentTagPath != null) {
@@ -92,39 +128,53 @@ class UsbMonitorService {
       }
 
       // ========================================================
-      // 新しいタグを探す
+      // Storage切替処理中
       // ========================================================
 
-      final detectedPath =
-          await _findNewTag();
-
-      if (detectedPath == null) {
+      if (_switchingToStorage) {
         return;
       }
 
-      _currentTagPath =
-          detectedPath;
+      // ========================================================
+      // まず、すでにStorageモードのタグがないか確認
+      //
+      // アプリ起動前にStorageモードになっていた場合に対応
+      // ========================================================
 
-      _mountMissCount = 0;
+      final existingStorage =
+          await _findMountedTagStorage();
 
-      debugPrint(
-        '================================',
-      );
+      if (existingStorage != null) {
+        await _confirmConnectedStorage(
+          existingStorage,
+        );
 
-      debugPrint(
-        'USB TAG CONNECTED',
-      );
+        return;
+      }
 
-      debugPrint(
-        'PATH: $detectedPath',
-      );
+      // ========================================================
+      // UARTタグを探す
+      // ========================================================
 
-      debugPrint(
-        '================================',
-      );
+      final portName =
+          TagSerialService.findTagPort();
 
-      onTagConnected(
-        detectedPath,
+      if (portName == null) {
+        return;
+      }
+
+      // ========================================================
+      // UART
+      // ↓
+      // TIME SYNC
+      // ↓
+      // MAC
+      // ↓
+      // USB Storage
+      // ========================================================
+
+      await _switchSerialTagToStorage(
+        portName,
       );
     } catch (e, stackTrace) {
       debugPrint(
@@ -140,7 +190,309 @@ class UsbMonitorService {
   }
 
   // ============================================================
-  // 現在のマウント確認
+  // UARTタグ → USB Storage
+  // ============================================================
+
+  Future<void> _switchSerialTagToStorage(
+    String portName,
+  ) async {
+    if (_switchingToStorage) {
+      return;
+    }
+
+    _switchingToStorage = true;
+
+    try {
+      debugPrint(
+        '================================',
+      );
+
+      debugPrint(
+        'SERIAL TAG FOUND',
+      );
+
+      debugPrint(
+        'PORT: $portName',
+      );
+
+      debugPrint(
+        '================================',
+      );
+
+      // ========================================================
+      // 切替前のStorage一覧を保存
+      // ========================================================
+
+      final beforeVolumes =
+          await _getMountedStoragePaths();
+
+      // ========================================================
+      // TIME SYNC
+      // MAC取得
+      // STORAGEコマンド送信
+      // ========================================================
+
+      final result =
+          await TagSerialService.initializeTag(
+        portName: portName,
+      );
+
+      _currentTagMac =
+          result.macAddress;
+
+      debugPrint(
+        'TAG MAC: '
+        '${result.macAddress}',
+      );
+
+      debugPrint(
+        'Waiting for USB storage...',
+      );
+
+      // ========================================================
+      // Storage出現待ち
+      // ========================================================
+
+      final storagePath =
+          await _waitForNewStorage(
+        beforeVolumes:
+            beforeVolumes,
+      );
+
+      if (storagePath == null) {
+        throw Exception(
+          'USB Storageへの切替後、'
+          'ストレージが見つかりませんでした。',
+        );
+      }
+
+      // ========================================================
+      // filesystem ready待ち
+      //
+      // Pythonで確認した
+      // 「Volume出現直後はまだ読めない」
+      // ケースへの対処
+      // ========================================================
+
+      final ready =
+          await _waitForFilesystemReady(
+        storagePath,
+      );
+
+      if (!ready) {
+        throw Exception(
+          'USB Storageは認識されましたが、'
+          'ファイルを読み込めませんでした。\n'
+          '$storagePath',
+        );
+      }
+
+      // ========================================================
+      // BLEタグとして確認
+      // ========================================================
+
+      final valid =
+          await _isTagStorage(
+        storagePath,
+      );
+
+      if (!valid) {
+        throw Exception(
+          'USB Storageは認識されましたが、'
+          'BLEタグ用のuser_info.txtが'
+          '見つかりませんでした。\n'
+          '$storagePath',
+        );
+      }
+
+      // ========================================================
+      // 接続確定
+      // ========================================================
+
+      await _confirmConnectedStorage(
+        storagePath,
+      );
+    } catch (e) {
+      _currentTagMac = null;
+
+      rethrow;
+    } finally {
+      _switchingToStorage = false;
+    }
+  }
+
+  // ============================================================
+  // Storage接続確定
+  // ============================================================
+
+  Future<void> _confirmConnectedStorage(
+    String storagePath,
+  ) async {
+    if (_currentTagPath != null) {
+      return;
+    }
+
+    _currentTagPath =
+        storagePath;
+
+    _mountMissCount = 0;
+
+    debugPrint(
+      '================================',
+    );
+
+    debugPrint(
+      'USB TAG CONNECTED',
+    );
+
+    debugPrint(
+      'PATH: $storagePath',
+    );
+
+    if (_currentTagMac != null) {
+      debugPrint(
+        'MAC: $_currentTagMac',
+      );
+    }
+
+    debugPrint(
+      '================================',
+    );
+
+    onTagConnected(
+      storagePath,
+    );
+  }
+
+  // ============================================================
+  // Storage出現待ち
+  // ============================================================
+
+  Future<String?> _waitForNewStorage({
+    required Set<String> beforeVolumes,
+  }) async {
+    // 最大15秒待つ
+
+    for (
+      int second = 1;
+      second <= 15;
+      second++
+    ) {
+      await Future.delayed(
+        const Duration(
+          seconds: 1,
+        ),
+      );
+
+      final currentVolumes =
+          await _getMountedStoragePaths();
+
+      final newVolumes =
+          currentVolumes
+              .difference(
+                beforeVolumes,
+              );
+
+      debugPrint(
+        '[STORAGE WAIT] '
+        '$second / 15',
+      );
+
+      debugPrint(
+        '[STORAGE WAIT] '
+        'current=$currentVolumes',
+      );
+
+      if (newVolumes.isEmpty) {
+        continue;
+      }
+
+      // ========================================================
+      // 新しく出たVolumeの中からタグを探す
+      // ========================================================
+
+      for (final path
+          in newVolumes) {
+        debugPrint(
+          '[STORAGE FOUND] '
+          '$path',
+        );
+
+        return path;
+      }
+    }
+
+    return null;
+  }
+
+  // ============================================================
+  // filesystem ready待ち
+  // ============================================================
+
+  Future<bool> _waitForFilesystemReady(
+    String storagePath,
+  ) async {
+    for (
+      int retry = 1;
+      retry <= 10;
+      retry++
+    ) {
+      try {
+        final directory =
+            Directory(
+          storagePath,
+        );
+
+        if (!await directory.exists()) {
+          await Future.delayed(
+            const Duration(
+              seconds: 1,
+            ),
+          );
+
+          continue;
+        }
+
+        // 実際に一覧を読む
+        await directory
+            .list(
+              recursive: false,
+              followLinks: false,
+            )
+            .toList();
+
+        debugPrint(
+          '[FILESYSTEM READY] '
+          'after ${retry}s',
+        );
+
+        return true;
+      } on FileSystemException catch (e) {
+        debugPrint(
+          '[FILESYSTEM WAIT] '
+          '$retry / 10 '
+          '$e',
+        );
+      } catch (e) {
+        debugPrint(
+          '[FILESYSTEM WAIT] '
+          '$retry / 10 '
+          '$e',
+        );
+      }
+
+      await Future.delayed(
+        const Duration(
+          seconds: 1,
+        ),
+      );
+    }
+
+    return false;
+  }
+
+  // ============================================================
+  // 現在のStorageがまだ存在するか確認
   // ============================================================
 
   Future<void> _checkCurrentMount() async {
@@ -154,36 +506,13 @@ class UsbMonitorService {
     bool mountFound = false;
 
     try {
-      if (Platform.isMacOS) {
-        final root =
-            Directory('/Volumes');
-
-        if (await root.exists()) {
-          final entities =
-              await root
-                  .list(
-                    recursive: false,
-                    followLinks: false,
-                  )
-                  .toList();
-
-          for (final entity in entities) {
-            if (entity.path ==
-                currentPath) {
-              mountFound = true;
-
-              break;
-            }
-          }
-        }
-      } else {
-        mountFound =
-            await Directory(
-          currentPath,
-        ).exists();
-      }
+      mountFound =
+          await Directory(
+        currentPath,
+      ).exists();
     } catch (e) {
       // 一時的な監視エラーだけで切断しない
+
       debugPrint(
         'USB mount check error: $e',
       );
@@ -241,11 +570,19 @@ class UsbMonitorService {
       'OLD PATH: $currentPath',
     );
 
+    if (_currentTagMac != null) {
+      debugPrint(
+        'OLD MAC: $_currentTagMac',
+      );
+    }
+
     debugPrint(
       '================================',
     );
 
     _currentTagPath = null;
+
+    _currentTagMac = null;
 
     _mountMissCount = 0;
 
@@ -253,42 +590,116 @@ class UsbMonitorService {
   }
 
   // ============================================================
-  // OS別検索
+  // すでにStorageモードのタグを探す
   // ============================================================
 
-  Future<String?> _findNewTag() async {
+  Future<String?>
+      _findMountedTagStorage() async {
+    final paths =
+        await _getMountedStoragePaths();
+
+    for (final path in paths) {
+      try {
+        if (await _isTagStorage(
+          path,
+        )) {
+          return path;
+        }
+      } catch (_) {
+        // 読めないVolumeは無視
+      }
+    }
+
+    return null;
+  }
+
+  // ============================================================
+  // BLEタグStorage判定
+  //
+  // user_info.txt があればタグとして扱う
+  // ============================================================
+
+  Future<bool> _isTagStorage(
+    String folderPath,
+  ) async {
+    final separator =
+        Platform.isWindows
+            ? '\\'
+            : '/';
+
+    final candidates =
+        <String>[
+      'user_info.txt',
+      'USER_INFO.TXT',
+      'User_Info.txt',
+    ];
+
+    for (final fileName
+        in candidates) {
+      final path =
+          '$folderPath'
+          '$separator'
+          '$fileName';
+
+      try {
+        if (await File(
+          path,
+        ).exists()) {
+          debugPrint(
+            'BLE tag storage confirmed',
+          );
+
+          debugPrint(
+            'user_info: $path',
+          );
+
+          return true;
+        }
+      } catch (_) {
+        // 他Volumeなどは無視
+      }
+    }
+
+    return false;
+  }
+
+  // ============================================================
+  // OS別マウント一覧
+  // ============================================================
+
+  Future<Set<String>>
+      _getMountedStoragePaths() async {
     if (Platform.isMacOS) {
-      return _findTagOnMacOS();
+      return _getMacVolumes();
     }
 
     if (Platform.isWindows) {
-      return _findTagOnWindows();
+      return _getWindowsVolumes();
     }
 
     if (Platform.isLinux) {
-      return _findTagOnLinux();
+      return _getLinuxVolumes();
     }
 
-    debugPrint(
-      'Unsupported OS: '
-      '${Platform.operatingSystem}',
-    );
-
-    return null;
+    return <String>{};
   }
 
   // ============================================================
   // macOS
   // ============================================================
 
-  Future<String?> _findTagOnMacOS() async {
+  Future<Set<String>>
+      _getMacVolumes() async {
+    final result =
+        <String>{};
+
     final root =
         Directory(
       '/Volumes',
     );
 
     if (!await root.exists()) {
-      return null;
+      return result;
     }
 
     try {
@@ -300,24 +711,21 @@ class UsbMonitorService {
               )
               .toList();
 
-      for (final entity in entities) {
+      for (final entity
+          in entities) {
         if (entity is! Directory) {
           continue;
         }
 
+        // 内蔵ディスク除外
         if (entity.path ==
             '/Volumes/Macintosh HD') {
           continue;
         }
 
-        final result =
-            await _checkCandidateTag(
+        result.add(
           entity.path,
         );
-
-        if (result != null) {
-          return result;
-        }
       }
     } catch (e) {
       debugPrint(
@@ -325,14 +733,20 @@ class UsbMonitorService {
       );
     }
 
-    return null;
+    return result;
   }
 
   // ============================================================
   // Windows
   // ============================================================
 
-  Future<String?> _findTagOnWindows() async {
+  Future<Set<String>>
+      _getWindowsVolumes() async {
+    final result =
+        <String>{};
+
+    // D: ～ Z:
+
     for (
       int code = 68;
       code <= 90;
@@ -341,37 +755,29 @@ class UsbMonitorService {
       final drive =
           '${String.fromCharCode(code)}:\\';
 
-      final directory =
-          Directory(
-        drive,
-      );
-
       try {
-        if (!await directory.exists()) {
-          continue;
-        }
-
-        final result =
-            await _checkCandidateTag(
+        if (await Directory(
           drive,
-        );
-
-        if (result != null) {
-          return result;
+        ).exists()) {
+          result.add(
+            drive,
+          );
         }
-      } catch (_) {
-        // 読めないドライブは無視
-      }
+      } catch (_) {}
     }
 
-    return null;
+    return result;
   }
 
   // ============================================================
   // Linux
   // ============================================================
 
-  Future<String?> _findTagOnLinux() async {
+  Future<Set<String>>
+      _getLinuxVolumes() async {
+    final result =
+        <String>{};
+
     final roots =
         <String>[];
 
@@ -406,8 +812,11 @@ class UsbMonitorService {
     final checked =
         <String>{};
 
-    for (final rootPath in roots) {
-      if (!checked.add(rootPath)) {
+    for (final rootPath
+        in roots) {
+      if (!checked.add(
+        rootPath,
+      )) {
         continue;
       }
 
@@ -429,18 +838,13 @@ class UsbMonitorService {
                 )
                 .toList();
 
-        for (final entity in entities) {
-          if (entity is! Directory) {
-            continue;
-          }
-
-          final result =
-              await _checkCandidateTag(
-            entity.path,
-          );
-
-          if (result != null) {
-            return result;
+        for (final entity
+            in entities) {
+          if (entity
+              is Directory) {
+            result.add(
+              entity.path,
+            );
           }
         }
       } catch (e) {
@@ -451,57 +855,6 @@ class UsbMonitorService {
       }
     }
 
-    return null;
-  }
-
-  // ============================================================
-  // BLEタグ判定
-  // ============================================================
-
-  Future<String?> _checkCandidateTag(
-    String folderPath,
-  ) async {
-    final separator =
-        Platform.isWindows
-            ? '\\'
-            : '/';
-
-    final candidates =
-        <String>[
-      'user_info.txt',
-      'USER_INFO.TXT',
-      'User_Info.txt',
-    ];
-
-    for (final fileName
-        in candidates) {
-      final path =
-          '$folderPath'
-          '$separator'
-          '$fileName';
-
-      final file =
-          File(
-        path,
-      );
-
-      try {
-        if (await file.exists()) {
-          debugPrint(
-            'BLE tag candidate confirmed',
-          );
-
-          debugPrint(
-            'user_info: $path',
-          );
-
-          return folderPath;
-        }
-      } catch (_) {
-        // 未接続探索中なので無視
-      }
-    }
-
-    return null;
+    return result;
   }
 }

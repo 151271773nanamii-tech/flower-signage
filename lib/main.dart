@@ -578,7 +578,8 @@ class _TagFolderScreenState
 
       int deleted = 0;
 
-      if (cfg.deleteProcessedLogs) {
+      if (cfg.deleteLogsAfterSuccess &&
+          cfg.deleteProcessedLogs) {
         if (mounted) {
           setState(() {
             processStatus =
@@ -614,7 +615,8 @@ class _TagFolderScreenState
             deleted;
 
         processStatus =
-            cfg.deleteProcessedLogs
+            (cfg.deleteLogsAfterSuccess &&
+                    cfg.deleteProcessedLogs)
                 ? '処理済みLOG削除完了'
                 : '処理済みデータ';
 
@@ -1108,6 +1110,10 @@ class _TagFolderScreenState
     final flowerId =
         current['flower_id']
             .toString();
+      
+    final userFlowerId =
+    (current['id'] as num)
+        .toInt();
 
     // ==========================================================
     // Stage 0〜2
@@ -1119,11 +1125,8 @@ class _TagFolderScreenState
     if (stage < 3) {
       await DatabaseService.instance
           .updateFlowerGrowth(
-        userId:
-            userId,
-
-        flowerId:
-            flowerId,
+        userFlowerId:
+            userFlowerId,
 
         growthValue:
             growthValue,
@@ -1134,12 +1137,8 @@ class _TagFolderScreenState
 
       final updated =
           await DatabaseService.instance
-              .getFlower(
-        userId:
-            userId,
-
-        flowerId:
-            flowerId,
+              .getFlowerById(
+        userFlowerId,
       );
 
       return FlowerProcessResult(
@@ -1157,11 +1156,8 @@ class _TagFolderScreenState
 
     await DatabaseService.instance
         .markFlowerBloomed(
-      userId:
-          userId,
-
-      flowerId:
-          flowerId,
+      userFlowerId:
+          userFlowerId,
 
       growthValue:
           growthValue,

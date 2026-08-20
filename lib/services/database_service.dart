@@ -48,7 +48,7 @@ class DatabaseService {
     return factory.openDatabase(
       databasePath,
       options: OpenDatabaseOptions(
-        version: 2,
+        version: 3,
 
         onConfigure: (db) async {
           await db.execute(
@@ -87,45 +87,6 @@ class DatabaseService {
     );
 
     // ----------------------------------------------------------
-    // user_flowers
-    // ----------------------------------------------------------
-
-    await db.execute(
-      '''
-      CREATE TABLE user_flowers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        user_id TEXT NOT NULL,
-
-        flower_id TEXT NOT NULL,
-
-        growth_value INTEGER NOT NULL DEFAULT 0,
-
-        stage INTEGER NOT NULL DEFAULT 0,
-
-        is_active INTEGER NOT NULL DEFAULT 0,
-
-        is_bloomed INTEGER NOT NULL DEFAULT 0,
-
-        acquired_at TEXT NOT NULL,
-
-        bloomed_at TEXT,
-
-        updated_at TEXT NOT NULL,
-
-        UNIQUE(
-          user_id,
-          flower_id
-        ),
-
-        FOREIGN KEY(user_id)
-          REFERENCES users(user_id)
-          ON DELETE CASCADE
-      )
-      ''',
-    );
-
-    // ----------------------------------------------------------
     // seed_inventory
     // ----------------------------------------------------------
 
@@ -158,6 +119,52 @@ class DatabaseService {
         FOREIGN KEY(user_id)
           REFERENCES users(user_id)
           ON DELETE CASCADE
+      )
+      ''',
+    );
+
+    // ----------------------------------------------------------
+    // user_flowers
+    //
+    // v3: 1つのseed_inventoryレコードに対して
+    //     1つの育成花を対応させる。
+    //     同じflower_idを何度でも育成可能。
+    // ----------------------------------------------------------
+
+    await db.execute(
+      '''
+      CREATE TABLE user_flowers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+        user_id TEXT NOT NULL,
+
+        seed_id INTEGER,
+
+        flower_id TEXT NOT NULL,
+
+        growth_value INTEGER NOT NULL DEFAULT 0,
+
+        stage INTEGER NOT NULL DEFAULT 0,
+
+        is_active INTEGER NOT NULL DEFAULT 0,
+
+        is_bloomed INTEGER NOT NULL DEFAULT 0,
+
+        acquired_at TEXT NOT NULL,
+
+        bloomed_at TEXT,
+
+        updated_at TEXT NOT NULL,
+
+        UNIQUE(seed_id),
+
+        FOREIGN KEY(user_id)
+          REFERENCES users(user_id)
+          ON DELETE CASCADE,
+
+        FOREIGN KEY(seed_id)
+          REFERENCES seed_inventory(id)
+          ON DELETE SET NULL
       )
       ''',
     );
@@ -253,6 +260,88 @@ class DatabaseService {
         '''
         ALTER TABLE seed_inventory
         ADD COLUMN used_at TEXT
+        ''',
+      );
+    }
+
+    if (oldVersion < 3) {
+      // ==========================================================
+      // user_flowers v3
+      // ==========================================================
+
+      await db.execute(
+        '''
+        CREATE TABLE user_flowers_v3 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          seed_id INTEGER,
+          flower_id TEXT NOT NULL,
+          growth_value INTEGER NOT NULL DEFAULT 0,
+          stage INTEGER NOT NULL DEFAULT 0,
+          is_active INTEGER NOT NULL DEFAULT 0,
+          is_bloomed INTEGER NOT NULL DEFAULT 0,
+          acquired_at TEXT NOT NULL,
+          bloomed_at TEXT,
+          updated_at TEXT NOT NULL,
+          UNIQUE(seed_id),
+          FOREIGN KEY(user_id)
+            REFERENCES users(user_id)
+            ON DELETE CASCADE,
+          FOREIGN KEY(seed_id)
+            REFERENCES seed_inventory(id)
+            ON DELETE SET NULL
+        )
+        ''',
+      );
+
+      await db.execute(
+        '''
+        INSERT INTO user_flowers_v3 (
+          id,
+          user_id,
+          seed_id,
+          flower_id,
+          growth_value,
+          stage,
+          is_active,
+          is_bloomed,
+          acquired_at,
+          bloomed_at,
+          updated_at
+        )
+        SELECT
+          id,
+          user_id,
+          NULL,
+          flower_id,
+          growth_value,
+          stage,
+          is_active,
+          is_bloomed,
+          acquired_at,
+          bloomed_at,
+          updated_at
+        FROM user_flowers
+        ''',
+      );
+
+      await db.execute(
+        '''
+        DROP TABLE user_flowers
+        ''',
+      );
+
+      await db.execute(
+        '''
+        ALTER TABLE user_flowers_v3
+        RENAME TO user_flowers
+        ''',
+      );
+
+      await db.execute(
+        '''
+        CREATE INDEX IF NOT EXISTS idx_flower_user
+        ON user_flowers(user_id)
         ''',
       );
     }
@@ -767,8 +856,7 @@ class DatabaseService {
   // ============================================================
 
   Future<void> updateFlowerGrowth({
-    required String userId,
-    required String flowerId,
+    required int userFlowerId,
     required int growthValue,
     required int stage,
   }) async {
@@ -779,8 +867,7 @@ class DatabaseService {
       );
     }
 
-    if (stage < 0 ||
-        stage > 3) {
+    if (stage < 0 || stage > 3) {
       throw ArgumentError(
         'stageは0〜3で'
         'ある必要があります。',
@@ -788,37 +875,23 @@ class DatabaseService {
     }
 
     final db = await database;
-
-    final now =
-        DateTime.now().toIso8601String();
+    final now = DateTime.now().toIso8601String();
 
     final count = await db.update(
       'user_flowers',
       {
-        'growth_value':
-            growthValue,
-        'stage':
-            stage,
-        'updated_at':
-            now,
+        'growth_value': growthValue,
+        'stage': stage,
+        'updated_at': now,
       },
-      where:
-          '''
-          user_id = ?
-          AND flower_id = ?
-          ''',
-      whereArgs: [
-        userId,
-        flowerId,
-      ],
+      where: 'id = ?',
+      whereArgs: [userFlowerId],
     );
 
     if (count != 1) {
       throw Exception(
-        '花の成長状態更新に'
-        '失敗しました。\n'
-        'user: $userId\n'
-        'flower: $flowerId',
+        '花の成長状態更新に失敗しました。\n'
+        'user_flower_id: $userFlowerId',
       );
     }
   }
@@ -835,44 +908,53 @@ class DatabaseService {
 
     await db.transaction(
       (txn) async {
-        await txn.update(
+        final candidates = await txn.query(
           'user_flowers',
-          {
-            'is_active': 0,
-          },
-          where:
-              'user_id = ?',
-          whereArgs: [
-            userId,
-          ],
-        );
-
-        final count =
-            await txn.update(
-          'user_flowers',
-          {
-            'is_active': 1,
-            'updated_at':
-                DateTime.now()
-                    .toIso8601String(),
-          },
-          where:
-              '''
+          columns: ['id'],
+          where: '''
               user_id = ?
               AND flower_id = ?
               AND is_bloomed = 0
               ''',
-          whereArgs: [
-            userId,
-            flowerId,
-          ],
+          whereArgs: [userId, flowerId],
+          orderBy: 'id ASC',
+          limit: 1,
+        );
+
+        if (candidates.isEmpty) {
+          throw Exception(
+            '育成する花が見つかりません。\n'
+            'flower: $flowerId',
+          );
+        }
+
+        final targetId =
+            (candidates.first['id'] as num).toInt();
+
+        await txn.update(
+          'user_flowers',
+          {'is_active': 0},
+          where: 'user_id = ?',
+          whereArgs: [userId],
+        );
+
+        final count = await txn.update(
+          'user_flowers',
+          {
+            'is_active': 1,
+            'updated_at': DateTime.now().toIso8601String(),
+          },
+          where: '''
+              id = ?
+              AND is_bloomed = 0
+              ''',
+          whereArgs: [targetId],
         );
 
         if (count != 1) {
           throw Exception(
-            '育成する花の変更に'
-            '失敗しました。\n'
-            'flower: $flowerId',
+            '育成する花の変更に失敗しました。\n'
+            'user_flower_id: $targetId',
           );
         }
       },
@@ -884,47 +966,30 @@ class DatabaseService {
   // ============================================================
 
   Future<void> markFlowerBloomed({
-    required String userId,
-    required String flowerId,
+    required int userFlowerId,
     required int growthValue,
   }) async {
     final db = await database;
-
-    final now =
-        DateTime.now().toIso8601String();
+    final now = DateTime.now().toIso8601String();
 
     final count = await db.update(
       'user_flowers',
       {
-        'growth_value':
-            growthValue,
-        'stage':
-            3,
-        'is_bloomed':
-            1,
-        'is_active':
-            0,
-        'bloomed_at':
-            now,
-        'updated_at':
-            now,
+        'growth_value': growthValue,
+        'stage': 3,
+        'is_bloomed': 1,
+        'is_active': 0,
+        'bloomed_at': now,
+        'updated_at': now,
       },
-      where:
-          '''
-          user_id = ?
-          AND flower_id = ?
-          ''',
-      whereArgs: [
-        userId,
-        flowerId,
-      ],
+      where: 'id = ?',
+      whereArgs: [userFlowerId],
     );
 
     if (count != 1) {
       throw Exception(
-        '開花状態の保存に'
-        '失敗しました。\n'
-        'flower: $flowerId',
+        '開花状態の保存に失敗しました。\n'
+        'user_flower_id: $userFlowerId',
       );
     }
   }
@@ -943,21 +1008,14 @@ class DatabaseService {
 
     return db.transaction(
       (txn) async {
-        // ------------------------------------------------------
-        // すでに育成中なら何もしない
-        // ------------------------------------------------------
-
-        final active =
-            await txn.query(
+        final active = await txn.query(
           'user_flowers',
-          where:
-              '''
+          where: '''
               user_id = ?
               AND is_active = 1
               ''',
-          whereArgs: [
-            userId,
-          ],
+          whereArgs: [userId],
+          orderBy: 'id ASC',
           limit: 1,
         );
 
@@ -965,23 +1023,14 @@ class DatabaseService {
           return active.first;
         }
 
-        // ------------------------------------------------------
-        // 一番古い未使用種
-        // ------------------------------------------------------
-
-        final seeds =
-            await txn.query(
+        final seeds = await txn.query(
           'seed_inventory',
-          where:
-              '''
+          where: '''
               user_id = ?
               AND used = 0
               ''',
-          whereArgs: [
-            userId,
-          ],
-          orderBy:
-              'acquired_at ASC, id ASC',
+          whereArgs: [userId],
+          orderBy: 'acquired_at ASC, id ASC',
           limit: 1,
         );
 
@@ -989,132 +1038,86 @@ class DatabaseService {
           return null;
         }
 
-        final seed =
-            seeds.first;
+        final seed = seeds.first;
+        final seedId = (seed['id'] as num).toInt();
+        final flowerId = seed['flower_id'].toString();
+        final now = DateTime.now().toIso8601String();
 
-        final seedId =
-            (seed['id'] as num)
-                .toInt();
-
-        final flowerId =
-            seed['flower_id']
-                .toString();
-
-        final now =
-            DateTime.now()
-                .toIso8601String();
-
-        // ------------------------------------------------------
-        // Flowerを作る
-        // ------------------------------------------------------
-
-        await txn.insert(
+        final flowerRowId = await txn.insert(
           'user_flowers',
           {
-            'user_id':
-                userId,
-            'flower_id':
-                flowerId,
-            'growth_value':
-                0,
-            'stage':
-                0,
-            'is_active':
-                1,
-            'is_bloomed':
-                0,
-            'acquired_at':
-                now,
-            'updated_at':
-                now,
+            'user_id': userId,
+            'seed_id': seedId,
+            'flower_id': flowerId,
+            'growth_value': 0,
+            'stage': 0,
+            'is_active': 1,
+            'is_bloomed': 0,
+            'acquired_at': now,
+            'updated_at': now,
           },
-          conflictAlgorithm:
-              ConflictAlgorithm.ignore,
         );
 
-        // ------------------------------------------------------
-        // 既存Flowerだった場合もactiveへ
-        // ------------------------------------------------------
-
-        await txn.update(
-          'user_flowers',
-          {
-            'is_active':
-                1,
-            'updated_at':
-                now,
-          },
-          where:
-              '''
-              user_id = ?
-              AND flower_id = ?
-              AND is_bloomed = 0
-              ''',
-          whereArgs: [
-            userId,
-            flowerId,
-          ],
-        );
-
-        // ------------------------------------------------------
-        // Seedを使用済みへ
-        // ------------------------------------------------------
-
-        final usedCount =
-            await txn.update(
+        final usedCount = await txn.update(
           'seed_inventory',
           {
-            'used':
-                1,
-            'used_at':
-                now,
+            'used': 1,
+            'used_at': now,
           },
-          where:
-              '''
+          where: '''
               id = ?
               AND used = 0
               ''',
-          whereArgs: [
-            seedId,
-          ],
+          whereArgs: [seedId],
         );
 
         if (usedCount != 1) {
           throw Exception(
-            '種の使用状態更新に'
-            '失敗しました。',
+            '種の使用状態更新に失敗しました。\n'
+            'seed_id: $seedId',
           );
         }
 
-        // ------------------------------------------------------
-        // 結果
-        // ------------------------------------------------------
-
-        final result =
-            await txn.query(
+        final result = await txn.query(
           'user_flowers',
-          where:
-              '''
-              user_id = ?
-              AND flower_id = ?
-              ''',
-          whereArgs: [
-            userId,
-            flowerId,
-          ],
+          where: 'id = ?',
+          whereArgs: [flowerRowId],
           limit: 1,
         );
 
         if (result.isEmpty) {
           throw Exception(
-            '次の花の作成に'
-            '失敗しました。',
+            '次の花の作成に失敗しました。\n'
+            'seed_id: $seedId',
           );
         }
 
         return result.first;
       },
     );
+  }
+
+  // ============================================================
+  // FLOWER BY ID
+  // ============================================================
+
+  Future<Map<String, Object?>?> getFlowerById(
+    int userFlowerId,
+  ) async {
+    final db = await database;
+
+    final result = await db.query(
+      'user_flowers',
+      where: 'id = ?',
+      whereArgs: [userFlowerId],
+      limit: 1,
+    );
+
+    if (result.isEmpty) {
+      return null;
+    }
+
+    return result.first;
   }
 
   // ============================================================
