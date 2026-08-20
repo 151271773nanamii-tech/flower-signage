@@ -967,6 +967,13 @@ class _TagFolderScreenState
           result.userInfo.macAddress,
     );
 
+    await DatabaseService.instance
+        .ensureInitialSeeds(
+      userId: userId,
+      initialSeeds:
+          config!.initialSeeds,
+    );
+
     // ==========================================================
     // CHECKPOINT FIRST
     // ==========================================================

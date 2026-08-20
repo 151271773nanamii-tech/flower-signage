@@ -471,6 +471,60 @@ class DatabaseService {
     return result.first;
   }
 
+  Future<void> ensureInitialSeeds({
+    required String userId,
+    required List<String> initialSeeds,
+  }) async {
+    final db = await database;
+
+    final now =
+        DateTime.now().toIso8601String();
+
+    await db.transaction(
+      (txn) async {
+        for (final flowerId in initialSeeds) {
+          final sourceId =
+              'initial:$flowerId';
+
+          final existing =
+              await txn.query(
+            'seed_inventory',
+            columns: ['id'],
+            where: '''
+              user_id = ?
+              AND flower_id = ?
+              AND source_type = ?
+              AND source_id = ?
+            ''',
+            whereArgs: [
+              userId,
+              flowerId,
+              'initial',
+              sourceId,
+            ],
+            limit: 1,
+          );
+
+          if (existing.isNotEmpty) {
+            continue;
+          }
+
+          await txn.insert(
+            'seed_inventory',
+            {
+              'user_id': userId,
+              'flower_id': flowerId,
+              'source_type': 'initial',
+              'source_id': sourceId,
+              'acquired_at': now,
+              'used': 0,
+            },
+          );
+        }
+      },
+    );
+  }
+  
   // ============================================================
   // SEED
   // ============================================================
