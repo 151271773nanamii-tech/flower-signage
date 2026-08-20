@@ -484,6 +484,31 @@ class _TagFolderScreenState
 
     final growthValue =
         result.uniqueAddresses.length;
+    
+    // ==========================================================
+    // USER + INITIAL SEEDS
+    //
+    // 二重処理判定より前に行う。
+    // 処理済みLOGでも初期種を保証する。
+    // ==========================================================
+
+    await DatabaseService.instance
+        .upsertUser(
+      userId:
+          result.userInfo.userId,
+
+      tagMac:
+          result.userInfo.macAddress,
+    );
+
+    await DatabaseService.instance
+        .ensureInitialSeeds(
+      userId:
+          result.userInfo.userId,
+
+      initialSeeds:
+          cfg.initialSeeds,
+    );
 
     if (cfg.debugLogging) {
       debugPrint(
@@ -501,6 +526,109 @@ class _TagFolderScreenState
         '$growthValue',
       );
     }
+    
+    // ==========================================================
+    // LOG 0件
+    //
+    // エラーではなく正常終了。
+    // User登録・初期種付与までは実施する。
+    // 成長・Checkpoint・交流・ImportHistoryは実施しない。
+    // ==========================================================
+
+    if (result.logFiles.isEmpty) {
+      // 現在育成中の花を確認
+      var currentFlower =
+          await DatabaseService.instance
+              .getActiveFlower(
+        result.userInfo.userId,
+      );
+
+      // 初回ユーザーなど、
+      // まだ育成中の花がなければ
+      // 最初の初期種をStage 0で育成開始
+      currentFlower ??=
+          await DatabaseService.instance
+              .activateNextSeed(
+        result.userInfo.userId,
+      );
+
+      final seeds =
+          await DatabaseService.instance
+              .getSeeds(
+        result.userInfo.userId,
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        tagResult =
+            result;
+
+        seedInventory =
+            seeds;
+
+        activeFlower =
+            currentFlower;
+
+        checkpointHits =
+            [];
+
+        interactionHits =
+            [];
+
+        bloomedFlowerId =
+            null;
+
+        alreadyImported =
+            false;
+
+        deletedLogCount =
+            0;
+
+        processStatus =
+            '新しいLOGはありません';
+
+        isLoading =
+            false;
+      });
+
+      if (cfg.debugLogging) {
+        debugPrint(
+          '================================',
+        );
+
+        debugPrint(
+          '=== NO LOG FILES ===',
+        );
+
+        debugPrint(
+          'User = '
+          '${result.userInfo.userId}',
+        );
+
+        debugPrint(
+          'LOG count = 0',
+        );
+
+        debugPrint(
+          'Growth update = SKIPPED',
+        );
+
+        debugPrint(
+          'Active flower = '
+          '${currentFlower?['flower_id']}',
+        );
+
+        debugPrint(
+          '================================',
+        );
+      }
+
+      return;
+    }
+
 
     // ==========================================================
     // 2. HASH
@@ -958,21 +1086,7 @@ class _TagFolderScreenState
     final userId =
         result.userInfo.userId;
 
-    await DatabaseService.instance
-        .upsertUser(
-      userId:
-          userId,
 
-      tagMac:
-          result.userInfo.macAddress,
-    );
-
-    await DatabaseService.instance
-        .ensureInitialSeeds(
-      userId: userId,
-      initialSeeds:
-          config!.initialSeeds,
-    );
 
     // ==========================================================
     // CHECKPOINT FIRST

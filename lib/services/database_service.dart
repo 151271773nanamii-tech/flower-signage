@@ -477,19 +477,80 @@ class DatabaseService {
   }) async {
     final db = await database;
 
-    final now =
-        DateTime.now().toIso8601String();
-
     await db.transaction(
       (txn) async {
-        for (final flowerId in initialSeeds) {
+        // ========================================================
+        // ユーザー作成日時を取得
+        //
+        // 既存ユーザーへ後から初期種を追加した場合でも、
+        // Checkpoint/Interactionより先に並ぶようにする。
+        // ========================================================
+
+        final users = await txn.query(
+          'users',
+          columns: [
+            'created_at',
+          ],
+          where: 'user_id = ?',
+          whereArgs: [
+            userId,
+          ],
+          limit: 1,
+        );
+
+        if (users.isEmpty) {
+          throw Exception(
+            '初期種追加時にユーザーが'
+            '見つかりません。\n'
+            'user_id: $userId',
+          );
+        }
+
+        final acquiredAt =
+            users.first['created_at']
+                ?.toString();
+
+        if (acquiredAt == null ||
+            acquiredAt.isEmpty) {
+          throw Exception(
+            'ユーザー作成日時を'
+            '取得できませんでした。\n'
+            'user_id: $userId',
+          );
+        }
+
+        // ========================================================
+        // Configに書かれている順番で追加
+        //
+        // sunflower
+        // ↓
+        // tulip
+        //
+        // 同じacquired_atでもid ASCで順序が決まる。
+        // ========================================================
+
+        for (final flowerId
+            in initialSeeds) {
+          final normalizedFlowerId =
+              flowerId.trim();
+
+          if (normalizedFlowerId.isEmpty) {
+            continue;
+          }
+
           final sourceId =
-              'initial:$flowerId';
+              'initial:$normalizedFlowerId';
+
+          // ------------------------------------------------------
+          // すでに同じ初期種を持っているか
+          // ------------------------------------------------------
 
           final existing =
               await txn.query(
             'seed_inventory',
-            columns: ['id'],
+            columns: [
+              'id',
+            ],
             where: '''
               user_id = ?
               AND flower_id = ?
@@ -498,7 +559,7 @@ class DatabaseService {
             ''',
             whereArgs: [
               userId,
-              flowerId,
+              normalizedFlowerId,
               'initial',
               sourceId,
             ],
@@ -509,22 +570,37 @@ class DatabaseService {
             continue;
           }
 
+          // ------------------------------------------------------
+          // 初期種追加
+          // ------------------------------------------------------
+
           await txn.insert(
             'seed_inventory',
             {
-              'user_id': userId,
-              'flower_id': flowerId,
-              'source_type': 'initial',
-              'source_id': sourceId,
-              'acquired_at': now,
-              'used': 0,
+              'user_id':
+                  userId,
+
+              'flower_id':
+                  normalizedFlowerId,
+
+              'source_type':
+                  'initial',
+
+              'source_id':
+                  sourceId,
+
+              'acquired_at':
+                  acquiredAt,
+
+              'used':
+                  0,
             },
           );
         }
       },
     );
   }
-  
+
   // ============================================================
   // SEED
   // ============================================================
