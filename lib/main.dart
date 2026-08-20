@@ -1031,6 +1031,131 @@ class _TagFolderScreenState
     );
 
     // ==========================================================
+    // v5: 新規LOGをarchiveへ保存
+    //
+    // 既存の全処理とDB保存確認が成功した後に行う。
+    // ここまで到達したLOGだけを「処理済みLOG」として保存する。
+    // ==========================================================
+
+    int? archiveBatchId;
+
+    if (newLogFiles.isNotEmpty) {
+      archiveBatchId =
+          await DatabaseService.instance
+              .createImportBatch(
+        userId:
+            result.userInfo.userId,
+        batchHash:
+            importHash,
+        growthMetric:
+            cfg.growthMetric,
+      );
+
+      for (final logFile
+          in newLogFiles) {
+        final fileHash =
+            await TagFolderService
+                .calculateLogHash(
+          logFile,
+        );
+
+        final rawContent =
+            await logFile.readAsString();
+
+        // result.logFiles と result.logResults は
+        // 同じ順番で作成されているので対応付ける
+        final index =
+            result.logFiles.indexWhere(
+          (file) =>
+              file.path == logFile.path,
+        );
+
+        if (index < 0 ||
+            index >= result.logResults.length) {
+          throw Exception(
+            'LOG解析結果との対応付けに'
+            '失敗しました。\n'
+            '${logFile.path}',
+          );
+        }
+
+        final recordCount =
+            result
+                .logResults[index]
+                .records
+                .length;
+
+        await DatabaseService.instance
+            .archiveLog(
+          userId:
+              result.userInfo.userId,
+          batchId:
+              archiveBatchId,
+          fileName:
+              logFile.uri.pathSegments.last,
+          fileHash:
+              fileHash,
+          rawContent:
+              rawContent,
+          recordCount:
+              recordCount,
+        );
+      }
+
+      // -----------------------------------------------
+      // このBatch内のLOGを処理済みにする
+      // -----------------------------------------------
+
+      await DatabaseService.instance
+          .markBatchLogsProcessed(
+        archiveBatchId,
+      );
+
+      // -----------------------------------------------
+      // Batch自体もcompletedにする
+      // -----------------------------------------------
+
+      await DatabaseService.instance
+          .completeImportBatch(
+        batchId:
+            archiveBatchId,
+        growthValue:
+            growthValue,
+        recordCount:
+            result.totalRecordCount,
+        uniqueAddressCount:
+            growthValue,
+        checkpointCount:
+            uniqueCheckpointHits.length,
+        interactionCount:
+            uniqueInteractions.length,
+      );
+
+      if (cfg.debugLogging) {
+        debugPrint(
+          '================================',
+        );
+
+        debugPrint(
+          '=== LOG ARCHIVE SUCCESS ===',
+        );
+
+        debugPrint(
+          'Batch ID = $archiveBatchId',
+        );
+
+        debugPrint(
+          'Archived LOG = '
+          '${newLogFiles.length}',
+        );
+
+        debugPrint(
+          '================================',
+        );
+      }
+    }
+
+    // ==========================================================
     // 11. LOG DELETE
     // ==========================================================
 
