@@ -48,7 +48,7 @@ class DatabaseService {
     return factory.openDatabase(
       databasePath,
       options: OpenDatabaseOptions(
-        version: 3,
+        version: 5,
 
         onConfigure: (db) async {
           await db.execute(
@@ -200,7 +200,137 @@ class DatabaseService {
       )
       ''',
     );
+    // ----------------------------------------------------------
+    // import_batches
+    //
+    // 1回のLOG処理を1 Batchとして保存する。
+    // 前回と今回の成長量を混ぜない。
+    // ----------------------------------------------------------
 
+    await db.execute(
+      '''
+      CREATE TABLE import_batches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+        user_id TEXT NOT NULL,
+
+        batch_hash TEXT NOT NULL UNIQUE,
+
+        growth_metric TEXT NOT NULL,
+
+        growth_value INTEGER NOT NULL DEFAULT 0,
+
+        record_count INTEGER NOT NULL DEFAULT 0,
+
+        unique_address_count INTEGER NOT NULL DEFAULT 0,
+
+        checkpoint_count INTEGER NOT NULL DEFAULT 0,
+
+        interaction_count INTEGER NOT NULL DEFAULT 0,
+
+        status TEXT NOT NULL DEFAULT 'processing',
+
+        created_at TEXT NOT NULL,
+
+        completed_at TEXT,
+
+        FOREIGN KEY(user_id)
+          REFERENCES users(user_id)
+          ON DELETE CASCADE
+      )
+      ''',
+    );
+
+    // ----------------------------------------------------------
+    // log_archive
+    //
+    // LOGファイル1個につき1レコード。
+    // raw_content にLOG本体を保存する。
+    // file_hashにより部分削除後の二重処理を防止する。
+    // ----------------------------------------------------------
+
+    await db.execute(
+      '''
+      CREATE TABLE log_archive (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+        user_id TEXT NOT NULL,
+
+        batch_id INTEGER,
+
+        file_name TEXT NOT NULL,
+
+        file_hash TEXT NOT NULL,
+        raw_content TEXT,
+
+        record_count INTEGER NOT NULL DEFAULT 0,
+
+        processed INTEGER NOT NULL DEFAULT 0,
+
+        processed_at TEXT,
+
+        deleted_from_tag INTEGER NOT NULL DEFAULT 0,
+
+        deleted_at TEXT,
+
+        created_at TEXT NOT NULL,
+
+        FOREIGN KEY(user_id)
+          REFERENCES users(user_id)
+          ON DELETE CASCADE,
+
+        FOREIGN KEY(batch_id)
+          REFERENCES import_batches(id)
+          ON DELETE SET NULL,
+
+        UNIQUE(user_id, file_hash)
+      ''',
+    );
+
+    // ----------------------------------------------------------
+    // result_events
+    //
+    // DB処理は成功したが、まだ画面表示されていない結果を保存。
+    // 次回接続時に displayed = 0 の結果を再表示できる。
+    // ----------------------------------------------------------
+
+    await db.execute(
+      '''
+      CREATE TABLE result_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+        user_id TEXT NOT NULL,
+
+        batch_id INTEGER,
+
+        event_type TEXT NOT NULL,
+
+        flower_id TEXT,
+
+        growth_value INTEGER,
+
+        stage_before INTEGER,
+
+        stage_after INTEGER,
+
+        message TEXT NOT NULL,
+
+        displayed INTEGER NOT NULL DEFAULT 0,
+
+        created_at TEXT NOT NULL,
+
+        displayed_at TEXT,
+
+        FOREIGN KEY(user_id)
+          REFERENCES users(user_id)
+          ON DELETE CASCADE,
+
+        FOREIGN KEY(batch_id)
+          REFERENCES import_batches(id)
+          ON DELETE SET NULL
+      )
+      ''',
+    );
     await _createIndexes(db);
   }
 
@@ -345,6 +475,227 @@ class DatabaseService {
         ''',
       );
     }
+
+    if (oldVersion < 4) {
+      // ==========================================================
+      // v4
+      //
+      // ・接続処理をBatch単位で保存
+      // ・元LOGをファイル単位で保存
+      // ・未表示結果を保存
+      // ==========================================================
+
+      await db.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS import_batches (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+          user_id TEXT NOT NULL,
+
+          batch_hash TEXT NOT NULL UNIQUE,
+
+          growth_metric TEXT NOT NULL,
+
+          growth_value INTEGER NOT NULL DEFAULT 0,
+
+          record_count INTEGER NOT NULL DEFAULT 0,
+
+          unique_address_count INTEGER NOT NULL DEFAULT 0,
+
+          checkpoint_count INTEGER NOT NULL DEFAULT 0,
+
+          interaction_count INTEGER NOT NULL DEFAULT 0,
+
+          status TEXT NOT NULL DEFAULT 'processing',
+
+          created_at TEXT NOT NULL,
+
+          completed_at TEXT,
+
+          FOREIGN KEY(user_id)
+            REFERENCES users(user_id)
+            ON DELETE CASCADE
+        )
+        ''',
+      );
+
+      await db.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS log_archive (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+          user_id TEXT NOT NULL,
+
+          batch_id INTEGER,
+
+          file_name TEXT NOT NULL,
+
+          file_hash TEXT NOT NULL UNIQUE,
+
+          raw_content TEXT NOT NULL,
+
+          record_count INTEGER NOT NULL DEFAULT 0,
+
+          processed INTEGER NOT NULL DEFAULT 0,
+
+          processed_at TEXT,
+
+          deleted_from_tag INTEGER NOT NULL DEFAULT 0,
+
+          deleted_at TEXT,
+
+          created_at TEXT NOT NULL,
+
+          FOREIGN KEY(user_id)
+            REFERENCES users(user_id)
+            ON DELETE CASCADE,
+
+          FOREIGN KEY(batch_id)
+            REFERENCES import_batches(id)
+            ON DELETE SET NULL
+        )
+        ''',
+      );
+
+      await db.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS result_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+          user_id TEXT NOT NULL,
+
+          batch_id INTEGER,
+
+          event_type TEXT NOT NULL,
+
+          flower_id TEXT,
+
+          growth_value INTEGER,
+
+          stage_before INTEGER,
+
+          stage_after INTEGER,
+
+          message TEXT NOT NULL,
+
+          displayed INTEGER NOT NULL DEFAULT 0,
+
+          created_at TEXT NOT NULL,
+
+          displayed_at TEXT,
+
+          FOREIGN KEY(user_id)
+            REFERENCES users(user_id)
+            ON DELETE CASCADE,
+
+          FOREIGN KEY(batch_id)
+            REFERENCES import_batches(id)
+            ON DELETE SET NULL
+        )
+        ''',
+      );
+
+      await _createIndexes(db);
+    }
+
+    if (oldVersion < 5) {
+      // ==========================================================
+      // v5
+      //
+      // log_archive:
+      // ・raw_content を NULL 許可
+      // ・file_hash 単独 UNIQUE を廃止
+      // ・user_id + file_hash を UNIQUE にする
+      // ==========================================================
+
+      await db.execute(
+        '''
+        CREATE TABLE log_archive_v5 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+          user_id TEXT NOT NULL,
+
+          batch_id INTEGER,
+
+          file_name TEXT NOT NULL,
+
+          file_hash TEXT NOT NULL,
+
+          raw_content TEXT,
+
+          record_count INTEGER NOT NULL DEFAULT 0,
+
+          processed INTEGER NOT NULL DEFAULT 0,
+
+          processed_at TEXT,
+
+          deleted_from_tag INTEGER NOT NULL DEFAULT 0,
+
+          deleted_at TEXT,
+
+          created_at TEXT NOT NULL,
+
+          FOREIGN KEY(user_id)
+            REFERENCES users(user_id)
+            ON DELETE CASCADE,
+
+          FOREIGN KEY(batch_id)
+            REFERENCES import_batches(id)
+            ON DELETE SET NULL,
+
+          UNIQUE(user_id, file_hash)
+        )
+        ''',
+      );
+
+      await db.execute(
+        '''
+        INSERT INTO log_archive_v5 (
+          id,
+          user_id,
+          batch_id,
+          file_name,
+          file_hash,
+          raw_content,
+          record_count,
+          processed,
+          processed_at,
+          deleted_from_tag,
+          deleted_at,
+          created_at
+        )
+        SELECT
+          id,
+          user_id,
+          batch_id,
+          file_name,
+          file_hash,
+          raw_content,
+          record_count,
+          processed,
+          processed_at,
+          deleted_from_tag,
+          deleted_at,
+          created_at
+        FROM log_archive
+        ''',
+      );
+
+      await db.execute(
+        '''
+        DROP TABLE log_archive
+        ''',
+      );
+
+      await db.execute(
+        '''
+        ALTER TABLE log_archive_v5
+        RENAME TO log_archive
+        ''',
+      );
+
+      await _createIndexes(db);
+    }
   }
 
   // ============================================================
@@ -372,6 +723,54 @@ class DatabaseService {
       '''
       CREATE INDEX IF NOT EXISTS idx_flower_user
       ON user_flowers(user_id)
+      ''',
+    );
+    await db.execute(
+      '''
+      CREATE INDEX IF NOT EXISTS idx_batch_user
+      ON import_batches(user_id)
+      ''',
+    );
+
+    await db.execute(
+      '''
+      CREATE INDEX IF NOT EXISTS idx_batch_status
+      ON import_batches(status)
+      ''',
+    );
+
+    await db.execute(
+      '''
+      CREATE INDEX IF NOT EXISTS idx_log_user
+      ON log_archive(user_id)
+      ''',
+    );
+
+    await db.execute(
+      '''
+      CREATE INDEX IF NOT EXISTS idx_log_batch
+      ON log_archive(batch_id)
+      ''',
+    );
+
+    await db.execute(
+      '''
+      CREATE INDEX IF NOT EXISTS idx_log_processed
+      ON log_archive(processed)
+      ''',
+    );
+
+    await db.execute(
+      '''
+      CREATE INDEX IF NOT EXISTS idx_result_user
+      ON result_events(user_id)
+      ''',
+    );
+
+    await db.execute(
+      '''
+      CREATE INDEX IF NOT EXISTS idx_result_displayed
+      ON result_events(user_id, displayed)
       ''',
     );
   }
@@ -1289,6 +1688,462 @@ class DatabaseService {
         'import_history',
       ),
     };
+  }
+
+  // ==========================================================
+  // v5: Import Batch
+  // ==========================================================
+
+  Future<int> createImportBatch({
+    required String userId,
+    required String batchHash,
+    required String growthMetric,
+  }) async {
+    final db = await database;
+
+    final now =
+        DateTime.now().toIso8601String();
+
+    return db.insert(
+      'import_batches',
+      {
+        'user_id': userId,
+        'batch_hash': batchHash,
+        'growth_metric': growthMetric,
+        'growth_value': 0,
+        'record_count': 0,
+        'unique_address_count': 0,
+        'checkpoint_count': 0,
+        'interaction_count': 0,
+        'status': 'processing',
+        'created_at': now,
+        'completed_at': null,
+      },
+      conflictAlgorithm:
+          ConflictAlgorithm.abort,
+    );
+  }
+
+
+  // ==========================================================
+  // v5: Batch取得
+  // ==========================================================
+
+  Future<Map<String, Object?>?> getImportBatchByHash(
+    String batchHash,
+  ) async {
+    final db = await database;
+
+    final rows = await db.query(
+      'import_batches',
+      where: 'batch_hash = ?',
+      whereArgs: [
+        batchHash,
+      ],
+      limit: 1,
+    );
+
+    if (rows.isEmpty) {
+      return null;
+    }
+
+    return rows.first;
+  }
+
+
+  // ==========================================================
+  // v5: Batch完了
+  // ==========================================================
+
+  Future<void> completeImportBatch({
+    required int batchId,
+    required int growthValue,
+    required int recordCount,
+    required int uniqueAddressCount,
+    required int checkpointCount,
+    required int interactionCount,
+  }) async {
+    final db = await database;
+
+    final now =
+        DateTime.now().toIso8601String();
+
+    await db.update(
+      'import_batches',
+      {
+        'growth_value':
+            growthValue,
+        'record_count':
+            recordCount,
+        'unique_address_count':
+            uniqueAddressCount,
+        'checkpoint_count':
+            checkpointCount,
+        'interaction_count':
+            interactionCount,
+        'status':
+            'completed',
+        'completed_at':
+            now,
+      },
+      where:
+          'id = ?',
+      whereArgs: [
+        batchId,
+      ],
+    );
+  }
+
+
+  // ==========================================================
+  // v5: Batch失敗
+  // ==========================================================
+
+  Future<void> failImportBatch(
+    int batchId,
+  ) async {
+    final db = await database;
+
+    await db.update(
+      'import_batches',
+      {
+        'status': 'failed',
+      },
+      where: 'id = ?',
+      whereArgs: [
+        batchId,
+      ],
+    );
+  }
+
+
+  // ==========================================================
+  // v5: LOG hash存在確認
+  //
+  // 同じユーザーの同じLOGを過去に保存しているか。
+  // ==========================================================
+
+  Future<bool> hasLogHash({
+    required String userId,
+    required String fileHash,
+  }) async {
+    final db = await database;
+
+    final rows = await db.query(
+      'log_archive',
+      columns: [
+        'id',
+      ],
+      where:
+          'user_id = ? AND file_hash = ?',
+      whereArgs: [
+        userId,
+        fileHash,
+      ],
+      limit: 1,
+    );
+
+    return rows.isNotEmpty;
+  }
+
+
+  // ==========================================================
+  // v5: LOG取得
+  // ==========================================================
+
+  Future<Map<String, Object?>?> getLogByHash({
+    required String userId,
+    required String fileHash,
+  }) async {
+    final db = await database;
+
+    final rows = await db.query(
+      'log_archive',
+      where:
+          'user_id = ? AND file_hash = ?',
+      whereArgs: [
+        userId,
+        fileHash,
+      ],
+      limit: 1,
+    );
+
+    if (rows.isEmpty) {
+      return null;
+    }
+
+    return rows.first;
+  }
+
+
+  // ==========================================================
+  // v5: LOG本体保存
+  //
+  // この時点では processed = 0。
+  // Batch全体の処理成功後に processed = 1 にする。
+  // ==========================================================
+
+  Future<int> archiveLog({
+    required String userId,
+    required int batchId,
+    required String fileName,
+    required String fileHash,
+    required String rawContent,
+    required int recordCount,
+  }) async {
+    final db = await database;
+
+    final now =
+        DateTime.now().toIso8601String();
+
+    return db.insert(
+      'log_archive',
+      {
+        'user_id':
+            userId,
+        'batch_id':
+            batchId,
+        'file_name':
+            fileName,
+        'file_hash':
+            fileHash,
+        'raw_content':
+            rawContent,
+        'record_count':
+            recordCount,
+        'processed':
+            0,
+        'processed_at':
+            null,
+        'deleted_from_tag':
+            0,
+        'deleted_at':
+            null,
+        'created_at':
+            now,
+      },
+      conflictAlgorithm:
+          ConflictAlgorithm.ignore,
+    );
+  }
+
+
+  // ==========================================================
+  // v5: Batch内LOGを処理済みにする
+  // ==========================================================
+
+  Future<void> markBatchLogsProcessed(
+    int batchId,
+  ) async {
+    final db = await database;
+
+    final now =
+        DateTime.now().toIso8601String();
+
+    await db.update(
+      'log_archive',
+      {
+        'processed':
+            1,
+        'processed_at':
+            now,
+      },
+      where:
+          'batch_id = ?',
+      whereArgs: [
+        batchId,
+      ],
+    );
+  }
+
+
+  // ==========================================================
+  // v5: USBから削除できたLOGを記録
+  // ==========================================================
+
+  Future<void> markLogDeletedFromTag({
+    required String userId,
+    required String fileHash,
+  }) async {
+    final db = await database;
+
+    final now =
+        DateTime.now().toIso8601String();
+
+    await db.update(
+      'log_archive',
+      {
+        'deleted_from_tag':
+            1,
+        'deleted_at':
+            now,
+      },
+      where:
+          'user_id = ? AND file_hash = ?',
+      whereArgs: [
+        userId,
+        fileHash,
+      ],
+    );
+  }
+
+
+  // ==========================================================
+  // v5: 指定Batch以外のLOG本文を削除
+  //
+  // hashなどの履歴は残す。
+  // raw_contentだけNULLにする。
+  // ==========================================================
+
+  Future<int> clearOldLogBodies({
+    required String userId,
+    required int keepBatchId,
+  }) async {
+    final db = await database;
+
+    return db.update(
+      'log_archive',
+      {
+        'raw_content': null,
+      },
+      where:
+          '''
+          user_id = ?
+          AND batch_id IS NOT NULL
+          AND batch_id != ?
+          AND processed = 1
+          ''',
+      whereArgs: [
+        userId,
+        keepBatchId,
+      ],
+    );
+  }
+
+
+  // ==========================================================
+  // v5: ユーザーのLOG履歴
+  // ==========================================================
+
+  Future<List<Map<String, Object?>>>
+      getLogArchive(
+    String userId,
+  ) async {
+    final db = await database;
+
+    return db.query(
+      'log_archive',
+      where:
+          'user_id = ?',
+      whereArgs: [
+        userId,
+      ],
+      orderBy:
+          'created_at ASC, id ASC',
+    );
+  }
+
+
+  // ==========================================================
+  // v5: Result Event保存
+  // ==========================================================
+
+  Future<int> addResultEvent({
+    required String userId,
+    required int batchId,
+    required String eventType,
+    String? flowerId,
+    int? growthValue,
+    int? stageBefore,
+    int? stageAfter,
+    required String message,
+  }) async {
+    final db = await database;
+
+    final now =
+        DateTime.now().toIso8601String();
+
+    return db.insert(
+      'result_events',
+      {
+        'user_id':
+            userId,
+        'batch_id':
+            batchId,
+        'event_type':
+            eventType,
+        'flower_id':
+            flowerId,
+        'growth_value':
+            growthValue,
+        'stage_before':
+            stageBefore,
+        'stage_after':
+            stageAfter,
+        'message':
+            message,
+        'displayed':
+            0,
+        'created_at':
+            now,
+        'displayed_at':
+            null,
+      },
+    );
+  }
+
+
+  // ==========================================================
+  // v5: 未表示Result取得
+  //
+  // 古いものから順番に返す。
+  // ==========================================================
+
+  Future<List<Map<String, Object?>>>
+      getPendingResultEvents(
+    String userId,
+  ) async {
+    final db = await database;
+
+    return db.query(
+      'result_events',
+      where:
+          'user_id = ? AND displayed = 0',
+      whereArgs: [
+        userId,
+      ],
+      orderBy:
+          'created_at ASC, id ASC',
+    );
+  }
+
+
+  // ==========================================================
+  // v5: Result表示済み
+  // ==========================================================
+
+  Future<void> markResultEventDisplayed(
+    int eventId,
+  ) async {
+    final db = await database;
+
+    final now =
+        DateTime.now().toIso8601String();
+
+    await db.update(
+      'result_events',
+      {
+        'displayed':
+            1,
+        'displayed_at':
+            now,
+      },
+      where:
+          'id = ?',
+      whereArgs: [
+        eventId,
+      ],
+    );
   }
 
   // ============================================================
