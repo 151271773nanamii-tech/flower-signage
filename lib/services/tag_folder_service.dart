@@ -5,6 +5,9 @@ import 'package:flutter/foundation.dart';
 import 'log_parser.dart';
 import 'user_info_parser.dart';
 
+// import 'dart:convert';
+import 'package:crypto/crypto.dart';
+
 class TagFolderResult {
   final UserInfo userInfo;
   final List<File> logFiles;
@@ -63,12 +66,21 @@ class TagFolderResult {
 
     return result;
   }
+
+
+
 }
 
 class TagFolderService {
   // ============================================================
   // TAG FOLDER LOAD
   // ============================================================
+  static Future<String> calculateLogHash(
+    File file,
+  ) async {
+    final bytes = await file.readAsBytes();
+    return sha256.convert(bytes).toString();
+  }
 
   static Future<TagFolderResult> loadFolder(
     String folderPath,

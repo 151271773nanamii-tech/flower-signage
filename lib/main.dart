@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
@@ -526,7 +528,7 @@ class _TagFolderScreenState
         '$growthValue',
       );
     }
-    
+
     // ==========================================================
     // LOG 0件
     //
@@ -629,6 +631,55 @@ class _TagFolderScreenState
       return;
     }
 
+    // ==========================================================
+    // v5 TEST: LOGごとのSHA-256 + 新規LOG判定
+    // ==========================================================
+
+    final newLogFiles = <File>[];
+    final knownLogFiles = <File>[];
+
+    for (final logFile in result.logFiles) {
+      final fileHash =
+          await TagFolderService.calculateLogHash(
+        logFile,
+      );
+
+      final exists =
+          await DatabaseService.instance.hasLogHash(
+        userId: result.userInfo.userId,
+        fileHash: fileHash,
+      );
+
+      if (exists) {
+        knownLogFiles.add(logFile);
+      } else {
+        newLogFiles.add(logFile);
+      }
+    }
+
+    debugPrint(
+      '================================',
+    );
+
+    debugPrint(
+      '=== LOG HASH CHECK ===',
+    );
+
+    debugPrint(
+      'Total LOG = ${result.logFiles.length}',
+    );
+
+    debugPrint(
+      'Already known = ${knownLogFiles.length}',
+    );
+
+    debugPrint(
+      'New LOG = ${newLogFiles.length}',
+    );
+
+    debugPrint(
+      '================================',
+    );
 
     // ==========================================================
     // 2. HASH
