@@ -11,6 +11,8 @@ import 'services/import_service.dart';
 import 'services/interaction_service.dart';
 import 'services/tag_folder_service.dart';
 import 'services/usb_monitor_service.dart';
+import 'services/safe_eject_service.dart';
+import 'services/log_parser.dart';
 
 void main() {
   runApp(
@@ -101,6 +103,7 @@ class _TagFolderScreenState
       'BLEタグを接続してください';
 
   bool isAutoProcessing = false;
+  bool isSafeEjecting = false;
 
   // ============================================================
   // INIT
@@ -300,10 +303,43 @@ class _TagFolderScreenState
             return;
           }
 
+          // ==========================================================
+          // 全処理成功後に安全な取り外し
+          // ==========================================================
+
           setState(() {
             usbStatus =
-                '処理が完了しました';
+                '処理が完了しました\n'
+                'タグを安全に取り外しています...';
+
+            processStatus =
+                'USB安全取り外し中';
           });
+
+          isSafeEjecting = true;
+
+          try {
+            await SafeEjectService.eject(
+              folderPath,
+            );
+
+            if (!mounted) {
+              return;
+            }
+
+            setState(() {
+              usbStatus =
+                  '処理が完了しました\n'
+                  'タグを抜いてください';
+
+              processStatus =
+                  '安全に取り外しました';
+            });
+          } catch (_) {
+            isSafeEjecting = false;
+
+            rethrow;
+          }
         } catch (e, stackTrace) {
           if (config!.debugLogging) {
             debugPrint(
@@ -347,6 +383,29 @@ class _TagFolderScreenState
         if (!mounted) {
           return;
         }
+
+        // ========================================================
+        // 正常Ejectによる切断
+        // ========================================================
+
+        if (isSafeEjecting) {
+          isSafeEjecting = false;
+
+          setState(() {
+            usbStatus =
+                '処理が完了しました\n'
+                'タグを抜いてください';
+
+            processStatus =
+                '安全に取り外しました';
+          });
+
+          return;
+        }
+
+        // ========================================================
+        // ユーザーが物理的に抜いた / 異常切断
+        // ========================================================
 
         setState(() {
           usbStatus =
@@ -484,8 +543,8 @@ class _TagFolderScreenState
       folderPath,
     );
 
-    final growthValue =
-        result.uniqueAddresses.length;
+    // final growthValue =
+    //     result.uniqueAddresses.length;
     
     // ==========================================================
     // USER + INITIAL SEEDS
@@ -525,7 +584,7 @@ class _TagFolderScreenState
 
       debugPrint(
         '[1] Unique addresses = '
-        '$growthValue',
+        '${result.uniqueAddresses.length}',
       );
     }
 
@@ -680,6 +739,167 @@ class _TagFolderScreenState
     debugPrint(
       '================================',
     );
+        
+    // ==========================================================
+    // 今回の新規LOGだけを処理対象にする
+    // ==========================================================
+
+    final newLogPaths =
+        newLogFiles
+            .map((file) => file.path)
+            .toSet();
+
+    final newLogResults =
+        <LogParseResult>[];
+
+    for (int i = 0;
+        i < result.logFiles.length;
+        i++) {
+      final file =
+          result.logFiles[i];
+
+      if (newLogPaths.contains(
+        file.path,
+      )) {
+        newLogResults.add(
+          result.logResults[i],
+        );
+      }
+    }
+
+    // 今回の新規LOGだけの全レコード
+    final newRecords =
+        newLogResults
+            .expand(
+              (logResult) =>
+                  logResult.records,
+            )
+            .toList();
+
+    // 今回の新規LOGだけのユニークMAC
+    final newUniqueAddresses =
+        newRecords
+            .map(
+              (record) =>
+                  record.address,
+            )
+            .toSet();
+
+    final newRecordCount =
+        newRecords.length;
+
+    final growthValue =
+        cfg.growthMetric ==
+                'detection_count'
+            ? newRecordCount
+            : newUniqueAddresses.length;
+
+    if (cfg.debugLogging) {
+      debugPrint(
+        '================================',
+      );
+
+      debugPrint(
+        '=== NEW LOG DATA ===',
+      );
+
+      debugPrint(
+        'New records = '
+        '$newRecordCount',
+      );
+
+      debugPrint(
+        'New unique addresses = '
+        '${newUniqueAddresses.length}',
+      );
+
+      debugPrint(
+        'Growth value = '
+        '$growthValue',
+      );
+
+      debugPrint(
+        '================================',
+      );
+    }
+
+    if (newLogFiles.isEmpty) {
+      final seeds =
+          await DatabaseService.instance
+              .getSeeds(
+        result.userInfo.userId,
+      );
+
+      final currentFlower =
+          await DatabaseService.instance
+              .getActiveFlower(
+        result.userInfo.userId,
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        tagResult =
+            result;
+
+        seedInventory =
+            seeds;
+
+        activeFlower =
+            currentFlower;
+
+        checkpointHits =
+            [];
+
+        interactionHits =
+            [];
+
+        bloomedFlowerId =
+            null;
+
+        alreadyImported =
+            true;
+
+        deletedLogCount =
+            0;
+
+        processStatus =
+            '新しいLOGはありません';
+
+        isLoading =
+            false;
+      });
+
+      if (cfg.debugLogging) {
+        debugPrint(
+          '================================',
+        );
+
+        debugPrint(
+          '=== NO NEW LOG ===',
+        );
+
+        debugPrint(
+          'Growth update = SKIPPED',
+        );
+
+        debugPrint(
+          'Checkpoint = SKIPPED',
+        );
+
+        debugPrint(
+          'Interaction = SKIPPED',
+        );
+
+        debugPrint(
+          '================================',
+        );
+      }
+
+      return;
+    }
 
     // ==========================================================
     // 2. HASH
@@ -810,13 +1030,7 @@ class _TagFolderScreenState
     // 4. RECORDS
     // ==========================================================
 
-    final allRecords =
-        result.logResults
-            .expand(
-              (logResult) =>
-                  logResult.records,
-            )
-            .toList();
+    final allRecords = newRecords;
 
     // ==========================================================
     // 5. CHECKPOINT
@@ -877,7 +1091,7 @@ class _TagFolderScreenState
     final rawInteractions =
         InteractionService.detect(
       detectedAddresses:
-          result.uniqueAddresses,
+          newUniqueAddresses,
 
       users:
           registeredUsers,
@@ -983,10 +1197,10 @@ class _TagFolderScreenState
           growthValue,
 
       recordCount:
-          result.totalRecordCount,
+          newRecordCount,
 
       uniqueAddressCount:
-          growthValue,
+          newUniqueAddresses.length,
 
       status:
           'completed',
@@ -1122,9 +1336,10 @@ class _TagFolderScreenState
         growthValue:
             growthValue,
         recordCount:
-            result.totalRecordCount,
+            newRecordCount,
+
         uniqueAddressCount:
-            growthValue,
+            newUniqueAddresses.length,
         checkpointCount:
             uniqueCheckpointHits.length,
         interactionCount:
