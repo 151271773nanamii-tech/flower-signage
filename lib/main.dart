@@ -1581,17 +1581,50 @@ class _TagFolderScreenState
       );
     }
 
-    final stage =
+    
+
+    // ==========================================================
+    // 今回のデータが何段階分の成長に相当するか
+    //
+    // 例:
+    //   0〜298   -> 0段階
+    //   299〜599 -> 1段階
+    //   600〜999 -> 2段階
+    //   1000〜   -> 3段階
+    // ==========================================================
+
+    int remainingStages =
         GrowthService.calculateStage(
       value:
           growthValue,
-
       config:
           config!,
     );
 
+    if (config!.debugLogging) {
+      debugPrint(
+        '================================',
+      );
+
+      debugPrint(
+        '=== FLOWER STAGE GROWTH ===',
+      );
+
+      debugPrint(
+        'Growth value = $growthValue',
+      );
+
+      debugPrint(
+        'Stage delta = $remainingStages',
+      );
+
+      debugPrint(
+        '================================',
+      );
+    }
+
     // ==========================================================
-    // 現在の花取得
+    // 現在育成中の花
     // ==========================================================
 
     var current =
@@ -1600,100 +1633,221 @@ class _TagFolderScreenState
       userId,
     );
 
-    // ==========================================================
-    // 現在の花がなければ
+    // 現在の花がなければ、
     // 一番古い未使用種を開始
-    // ==========================================================
-
     current ??=
         await DatabaseService.instance
             .activateNextSeed(
       userId,
     );
 
-    // 種そのものが無い
+    // 種自体がない
     if (current == null) {
       return const FlowerProcessResult(
-        activeFlower: null,
-        bloomedFlowerId: null,
-      );
-    }
-
-    final flowerId =
-        current['flower_id']
-            .toString();
-      
-    final userFlowerId =
-    (current['id'] as num)
-        .toInt();
-
-    // ==========================================================
-    // Stage 0〜2
-    //
-    // 今回のデータだけを保存
-    // 累積しない
-    // ==========================================================
-
-    if (stage < 3) {
-      await DatabaseService.instance
-          .updateFlowerGrowth(
-        userFlowerId:
-            userFlowerId,
-
-        growthValue:
-            growthValue,
-
-        stage:
-            stage,
-      );
-
-      final updated =
-          await DatabaseService.instance
-              .getFlowerById(
-        userFlowerId,
-      );
-
-      return FlowerProcessResult(
         activeFlower:
-            updated,
-
+            null,
         bloomedFlowerId:
             null,
       );
     }
 
+    // 今回Stage 0相当なら
+    // 現在の状態を変更しない
+    if (remainingStages <= 0) {
+      return FlowerProcessResult(
+        activeFlower:
+            current,
+        bloomedFlowerId:
+            null,
+      );
+    }
+
+    String? bloomedFlowerId;
+
     // ==========================================================
-    // Stage 3
+    // 段階数を順番に消費する
     // ==========================================================
 
-    await DatabaseService.instance
-        .markFlowerBloomed(
-      userFlowerId:
-          userFlowerId,
+    while (remainingStages > 0 &&
+        current != null) {
+      final userFlowerId =
+          (current['id'] as num)
+              .toInt();
 
-      growthValue:
-          growthValue,
-    );
+      final flowerId =
+          current['flower_id']
+              .toString();
 
-    // ==========================================================
-    // 同じ接続処理内で次の種へ
-    // ==========================================================
+      final currentStage =
+          (current['stage'] as num?)
+                  ?.toInt() ??
+              0;
 
-    final next =
+      // 開花まであと何段階必要か
+      final stagesToBloom =
+          3 - currentStage;
+
+      if (config!.debugLogging) {
+        debugPrint(
+          'Flower = $flowerId',
+        );
+
+        debugPrint(
+          'Current stage = '
+          '$currentStage',
+        );
+
+        debugPrint(
+          'Remaining stages = '
+          '$remainingStages',
+        );
+
+        debugPrint(
+          'Stages to bloom = '
+          '$stagesToBloom',
+        );
+      }
+
+      // ========================================================
+      // 今回の残り段階だけでは開花しない
+      // ========================================================
+
+      if (remainingStages <
+          stagesToBloom) {
+        final newStage =
+            currentStage +
+                remainingStages;
+
         await DatabaseService.instance
-            .activateNextSeed(
-      userId,
-    );
+            .updateFlowerGrowth(
+          userFlowerId:
+              userFlowerId,
+
+          growthValue:
+              _growthValueForStage(
+            newStage,
+          ),
+
+          stage:
+              newStage,
+        );
+
+        remainingStages = 0;
+
+        current =
+            await DatabaseService.instance
+                .getFlowerById(
+          userFlowerId,
+        );
+
+        if (config!.debugLogging) {
+          debugPrint(
+            'Flower stage updated: '
+            '$currentStage -> $newStage',
+          );
+        }
+
+        break;
+      }
+
+      // ========================================================
+      // 現在の花が開花する
+      // ========================================================
+
+      remainingStages -=
+          stagesToBloom;
+
+      await DatabaseService.instance
+          .markFlowerBloomed(
+        userFlowerId:
+            userFlowerId,
+
+        growthValue:
+            _growthValueForStage(
+          3,
+        ),
+      );
+
+      bloomedFlowerId =
+          flowerId;
+
+      if (config!.debugLogging) {
+        debugPrint(
+          'Flower bloomed: '
+          '$flowerId',
+        );
+
+        debugPrint(
+          'Remaining stages after bloom = '
+          '$remainingStages',
+        );
+      }
+
+      // ========================================================
+      // 次の種を育成開始
+      // ========================================================
+
+      current =
+          await DatabaseService.instance
+              .activateNextSeed(
+        userId,
+      );
+
+      // 次の種がなければ、
+      // 余った段階はここで終了
+      if (current == null) {
+        if (config!.debugLogging) {
+          debugPrint(
+            'No next seed.',
+          );
+
+          debugPrint(
+            'Unused stages = '
+            '$remainingStages',
+          );
+        }
+
+        remainingStages = 0;
+
+        break;
+      }
+    }
 
     return FlowerProcessResult(
       activeFlower:
-          next,
+          current,
 
       bloomedFlowerId:
-          flowerId,
+          bloomedFlowerId,
     );
   }
 
+  // ★ この位置に置く
+  int _growthValueForStage(
+    int stage,
+  ) {
+    if (config == null) {
+      return 0;
+    }
+
+    switch (stage) {
+      case 0:
+        return 0;
+
+      case 1:
+        return config!.stage1Threshold;
+
+      case 2:
+        return config!.stage2Threshold;
+
+      case 3:
+        return config!.stage3Threshold;
+
+      default:
+        return 0;
+    }
+  }
+  
   // ============================================================
   // CURRENT VALUES
   // ============================================================
