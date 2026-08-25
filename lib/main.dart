@@ -14,6 +14,14 @@ import 'services/usb_monitor_service.dart';
 import 'services/safe_eject_service.dart';
 import 'services/log_parser.dart';
 
+enum SignageViewState {
+  waiting,
+  processing,
+  growth,
+  bloom,
+  complete,
+}
+
 void main() {
   runApp(
     const FlowerSignageApp(),
@@ -27,10 +35,14 @@ class FlowerSignageApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const MaterialApp(
+    return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Flower Signage',
-      home: TagFolderScreen(),
+      theme: ThemeData(
+        useMaterial3: true,
+        fontFamily: 'sans-serif',
+      ),
+      home: const TagFolderScreen(),
     );
   }
 }
@@ -104,6 +116,16 @@ class _TagFolderScreenState
 
   bool isAutoProcessing = false;
   bool isSafeEjecting = false;
+
+  // ============================================================
+  // SIGNAGE UI
+  // ============================================================
+
+  SignageViewState signageViewState =
+      SignageViewState.waiting;
+
+  String? uiFlowerId;
+  int uiStage = 0;
 
   // ============================================================
   // INIT
@@ -203,6 +225,9 @@ class _TagFolderScreenState
 
         registeredUsers =
             loadedUsers;
+
+        signageViewState =
+            SignageViewState.waiting;
       });
 
       _startUsbMonitor();
@@ -293,6 +318,9 @@ class _TagFolderScreenState
 
             deletedLogCount =
                 0;
+
+            signageViewState =
+                SignageViewState.processing;
           });
 
           await _processTagFolder(
@@ -314,6 +342,9 @@ class _TagFolderScreenState
 
             processStatus =
                 'USB安全取り外し中';
+
+            signageViewState =
+                SignageViewState.processing;
           });
 
           isSafeEjecting = true;
@@ -334,6 +365,9 @@ class _TagFolderScreenState
 
               processStatus =
                   '安全に取り外しました';
+
+              signageViewState =
+                  SignageViewState.complete;
             });
           } catch (_) {
             isSafeEjecting = false;
@@ -398,6 +432,9 @@ class _TagFolderScreenState
 
             processStatus =
                 '安全に取り外しました';
+
+            signageViewState =
+                SignageViewState.complete;
           });
 
           return;
@@ -413,6 +450,9 @@ class _TagFolderScreenState
 
           processStatus =
               '待機中';
+
+          signageViewState =
+              SignageViewState.waiting;
         });
       },
     );
@@ -520,6 +560,9 @@ class _TagFolderScreenState
 
         processStatus =
             '[1] LOG読込中';
+
+        signageViewState =
+            SignageViewState.processing;
       });
     }
 
@@ -1427,7 +1470,20 @@ class _TagFolderScreenState
 
       isLoading =
           false;
+
+      uiFlowerId =
+          flowerResult.activeFlower?['flower_id']
+              ?.toString();
+
+      uiStage =
+          (flowerResult.activeFlower?['stage'] as num?)
+                  ?.toInt() ??
+              0;
     });
+
+    await _playResultPresentation(
+      flowerResult,
+    );
 
     if (cfg.debugLogging) {
       debugPrint(
@@ -1884,49 +1940,461 @@ class _TagFolderScreenState
   }
 
   // ============================================================
-  // SIMPLE DEBUG UI
+  // SIGNAGE UI HELPERS
   // ============================================================
 
-  String get flowerEmoji {
-    switch (currentStage) {
+  String _flowerAsset(
+    String flowerId,
+    String suffix,
+  ) {
+    return 'assets/images/'
+        '${flowerId}_$suffix.png';
+  }
+
+  Widget _buildFlowerStage({
+    required String flowerId,
+    required int stage,
+    double height = 320,
+  }) {
+    if (flowerId.isEmpty ||
+        flowerId == 'なし') {
+      return SizedBox(
+        height: height,
+        child: const Center(
+          child: Icon(
+            Icons.local_florist_outlined,
+            size: 110,
+          ),
+        ),
+      );
+    }
+
+    switch (stage) {
       case 0:
-        return '🫘';
+        return SizedBox(
+          height: height,
+          child: Center(
+            child: Image.asset(
+              _flowerAsset(
+                flowerId,
+                'seed',
+              ),
+              height: height * 0.42,
+              fit: BoxFit.contain,
+            ),
+          ),
+        );
 
       case 1:
-        return '🌱';
+        return SizedBox(
+          height: height,
+          child: Center(
+            child: Image.asset(
+              _flowerAsset(
+                flowerId,
+                'mini',
+              ),
+              height: height * 0.68,
+              fit: BoxFit.contain,
+            ),
+          ),
+        );
 
       case 2:
-        return '🌿';
+        return SizedBox(
+          height: height,
+          width: height * 0.9,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              Positioned(
+                bottom: 0,
+                child: Image.asset(
+                  _flowerAsset(
+                    flowerId,
+                    'big',
+                  ),
+                  height: height * 0.82,
+                  fit: BoxFit.contain,
+                ),
+              ),
+              Positioned(
+                top: height * 0.01,
+                child: Image.asset(
+                  _flowerAsset(
+                    flowerId,
+                    'befoflo',
+                  ),
+                  height: height * 0.36,
+                  fit: BoxFit.contain,
+                ),
+              ),
+            ],
+          ),
+        );
 
       case 3:
-        return '🌻';
+        return SizedBox(
+          height: height,
+          width: height * 0.9,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              Positioned(
+                bottom: 0,
+                child: Image.asset(
+                  _flowerAsset(
+                    flowerId,
+                    'big',
+                  ),
+                  height: height * 0.82,
+                  fit: BoxFit.contain,
+                ),
+              ),
+              Positioned(
+                top: 0,
+                child: Image.asset(
+                  'assets/images/'
+                  '$flowerId.png',
+                  height: height * 0.40,
+                  fit: BoxFit.contain,
+                ),
+              ),
+            ],
+          ),
+        );
 
       default:
-        return '🫘';
+        return const SizedBox();
     }
   }
 
-  String get stageMessage {
-    if (activeFlower == null) {
-      return '育てる種がありません';
+  Future<void> _playResultPresentation(
+    FlowerProcessResult flowerResult,
+  ) async {
+    if (!mounted) {
+      return;
     }
 
-    switch (currentStage) {
-      case 0:
-        return 'まだ芽は出ていません';
+    final bloomedId =
+        flowerResult.bloomedFlowerId;
 
-      case 1:
-        return '芽が出ました';
+    if (bloomedId != null) {
+      setState(() {
+        signageViewState =
+            SignageViewState.bloom;
 
-      case 2:
-        return '成長しています';
+        uiFlowerId =
+            bloomedId;
 
-      case 3:
-        return '花が咲きました';
+        uiStage =
+            3;
+      });
 
-      default:
-        return '';
+      await Future<void>.delayed(
+        const Duration(
+          milliseconds: 1800,
+        ),
+      );
+
+      if (!mounted) {
+        return;
+      }
     }
+
+    final nextFlower =
+        flowerResult.activeFlower;
+
+    if (nextFlower != null) {
+      final nextStage =
+          (nextFlower['stage'] as num?)
+                  ?.toInt() ??
+              0;
+
+      if (bloomedId == null ||
+          nextStage > 0) {
+        setState(() {
+          signageViewState =
+              SignageViewState.growth;
+
+          uiFlowerId =
+              nextFlower['flower_id']
+                  ?.toString();
+
+          uiStage =
+              nextStage;
+        });
+
+        await Future<void>.delayed(
+          const Duration(
+            milliseconds: 1400,
+          ),
+        );
+      }
+    }
+  }
+
+  Widget _buildMainSignageContent(
+    double availableHeight,
+  ) {
+    final mainImageHeight =
+        (availableHeight * 0.40)
+            .clamp(
+              180.0,
+              390.0,
+            )
+            .toDouble();
+
+    switch (signageViewState) {
+      case SignageViewState.waiting:
+        return _statusPanel(
+          image: Image.asset(
+            'assets/images/take.png',
+            height: mainImageHeight * 0.72,
+            fit: BoxFit.contain,
+          ),
+          title:
+              'タグを接続してください',
+          subtitle:
+              'ケーブルにタグを挿すと、自動で読み込みを開始します',
+        );
+
+      case SignageViewState.processing:
+        return _statusPanel(
+          image: Image.asset(
+            'assets/images/no_take.png',
+            height: mainImageHeight * 0.72,
+            fit: BoxFit.contain,
+          ),
+          title:
+              'タグを抜かないでください',
+          subtitle:
+              '活動データを読み込んでいます…',
+          loading:
+              true,
+        );
+
+      case SignageViewState.growth:
+        final flowerId =
+            uiFlowerId ??
+                currentFlowerId;
+
+        final stage =
+            uiFlowerId != null
+                ? uiStage
+                : currentStage;
+
+        return _statusPanel(
+          image: AnimatedSwitcher(
+            duration:
+                const Duration(
+              milliseconds: 650,
+            ),
+            transitionBuilder:
+                (
+              child,
+              animation,
+            ) {
+              return FadeTransition(
+                opacity:
+                    animation,
+                child:
+                    ScaleTransition(
+                  scale:
+                      Tween<double>(
+                    begin:
+                        0.82,
+                    end:
+                        1.0,
+                  ).animate(
+                    CurvedAnimation(
+                      parent:
+                          animation,
+                      curve:
+                          Curves.easeOutBack,
+                    ),
+                  ),
+                  child:
+                      child,
+                ),
+              );
+            },
+            child: KeyedSubtree(
+              key: ValueKey(
+                '$flowerId-$stage',
+              ),
+              child:
+                  _buildFlowerStage(
+                flowerId:
+                    flowerId,
+                stage:
+                    stage,
+                height:
+                    mainImageHeight,
+              ),
+            ),
+          ),
+          title:
+              '花が成長しました！',
+          subtitle:
+              'Stage $stage / 3',
+        );
+
+      case SignageViewState.bloom:
+        final flowerId =
+            uiFlowerId ??
+                bloomedFlowerId ??
+                currentFlowerId;
+
+        return _statusPanel(
+          image:
+              TweenAnimationBuilder<double>(
+            tween:
+                Tween<double>(
+              begin:
+                  0.55,
+              end:
+                  1.0,
+            ),
+            duration:
+                const Duration(
+              milliseconds:
+                  900,
+            ),
+            curve:
+                Curves.elasticOut,
+            builder:
+                (
+              context,
+              scale,
+              child,
+            ) {
+              return Transform.scale(
+                scale:
+                    scale,
+                child:
+                    child,
+              );
+            },
+            child:
+                _buildFlowerStage(
+              flowerId:
+                  flowerId,
+              stage:
+                  3,
+              height:
+                  mainImageHeight * 1.04,
+            ),
+          ),
+          title:
+              '花が咲きました！',
+          subtitle:
+              'おめでとうございます',
+          celebration:
+              true,
+        );
+
+      case SignageViewState.complete:
+        return _statusPanel(
+          image: Image.asset(
+            'assets/images/take.png',
+            height: mainImageHeight * 0.72,
+            fit: BoxFit.contain,
+          ),
+          title:
+              'タグを抜いてください',
+          subtitle:
+              '処理は完了しました。安全に取り外せます',
+        );
+    }
+  }
+
+  Widget _statusPanel({
+    required Widget image,
+    required String title,
+    required String subtitle,
+    bool loading = false,
+    bool celebration = false,
+  }) {
+    return Column(
+      mainAxisSize:
+          MainAxisSize.min,
+      children: [
+        image,
+
+        const SizedBox(
+          height:
+              14,
+        ),
+
+        if (celebration)
+          const Text(
+            '✨  ✨  ✨',
+            style:
+                TextStyle(
+              fontSize:
+                  30,
+            ),
+          ),
+
+        Text(
+          title,
+          textAlign:
+              TextAlign.center,
+          style:
+              const TextStyle(
+            fontSize:
+                38,
+            fontWeight:
+                FontWeight.w800,
+            color:
+                Color(
+              0xFF27462E,
+            ),
+          ),
+        ),
+
+        const SizedBox(
+          height:
+              8,
+        ),
+
+        Text(
+          subtitle,
+          textAlign:
+              TextAlign.center,
+          style:
+              const TextStyle(
+            fontSize:
+                20,
+            fontWeight:
+                FontWeight.w500,
+            color:
+                Color(
+              0xFF56705C,
+            ),
+          ),
+        ),
+
+        if (loading) ...[
+          const SizedBox(
+            height:
+                24,
+          ),
+          const SizedBox(
+            width:
+                42,
+            height:
+                42,
+            child:
+                CircularProgressIndicator(
+              strokeWidth:
+                  5,
+            ),
+          ),
+        ],
+      ],
+    );
   }
 
   // ============================================================
@@ -1940,7 +2408,12 @@ class _TagFolderScreenState
     if (config == null &&
         errorMessage == null) {
       return const Scaffold(
-        body: Center(
+        backgroundColor:
+            Color(
+          0xFFF4F7E8,
+        ),
+        body:
+            Center(
           child:
               CircularProgressIndicator(),
         ),
@@ -1948,215 +2421,213 @@ class _TagFolderScreenState
     }
 
     return Scaffold(
+      backgroundColor:
+          const Color(
+        0xFFF4F7E8,
+      ),
       body: SafeArea(
-        child: SingleChildScrollView(
-          padding:
-              const EdgeInsets.all(
-            32,
-          ),
-          child: Center(
-            child: ConstrainedBox(
-              constraints:
-                  const BoxConstraints(
-                maxWidth:
-                    850,
-              ),
-              child: Column(
-                children: [
-                  const SizedBox(
+        child: LayoutBuilder(
+          builder:
+              (
+            context,
+            constraints,
+          ) {
+            final sunSize =
+                (constraints.maxWidth *
+                        0.10)
+                    .clamp(
+                      82.0,
+                      150.0,
+                    )
+                    .toDouble();
+
+            final flowerBedHeight =
+                (constraints.maxHeight *
+                        0.25)
+                    .clamp(
+                      150.0,
+                      270.0,
+                    )
+                    .toDouble();
+
+            return Stack(
+              children: [
+                // ------------------------------------------------
+                // SUN
+                // ------------------------------------------------
+
+                Positioned(
+                  top:
+                      24,
+                  right:
+                      34,
+                  child:
+                      Image.asset(
+                    'assets/images/sun.png',
+                    width:
+                        sunSize,
                     height:
-                        20,
+                        sunSize,
+                    fit:
+                        BoxFit.contain,
                   ),
+                ),
 
-                  const Text(
-                    'BLEタグ 花育成システム',
-                    style:
-                        TextStyle(
-                      fontSize:
-                          38,
-                      fontWeight:
-                          FontWeight.bold,
-                    ),
-                  ),
+                // ------------------------------------------------
+                // MAIN CONTENT
+                // ------------------------------------------------
 
-                  const SizedBox(
-                    height:
-                        25,
-                  ),
-
-                  Text(
-                    usbStatus,
-                    textAlign:
-                        TextAlign.center,
-                    style:
-                        const TextStyle(
-                      fontSize:
-                          24,
-                      fontWeight:
-                          FontWeight.bold,
-                    ),
-                  ),
-
-                  const SizedBox(
-                    height:
-                        15,
-                  ),
-
-                  Text(
-                    '処理状態：'
-                    '$processStatus',
-                  ),
-
-                  const SizedBox(
-                    height:
-                        20,
-                  ),
-
-                  ElevatedButton(
-                    onPressed:
-                        isLoading
-                            ? null
-                            : selectTagFolder,
+                Positioned.fill(
+                  bottom:
+                      flowerBedHeight * 0.72,
+                  child:
+                      Center(
                     child:
-                        const Text(
-                      'タグフォルダを手動選択',
+                        Padding(
+                      padding:
+                          const EdgeInsets.symmetric(
+                        horizontal:
+                            40,
+                        vertical:
+                            24,
+                      ),
+                      child:
+                          AnimatedSwitcher(
+                        duration:
+                            const Duration(
+                          milliseconds:
+                              450,
+                        ),
+                        child:
+                            KeyedSubtree(
+                          key:
+                              ValueKey(
+                            signageViewState,
+                          ),
+                          child:
+                              _buildMainSignageContent(
+                            constraints.maxHeight,
+                          ),
+                        ),
+                      ),
                     ),
                   ),
+                ),
 
-                  if (isLoading) ...[
-                    const SizedBox(
-                      height:
-                          20,
+                // ------------------------------------------------
+                // FLOWER BED
+                // ------------------------------------------------
+
+                Positioned(
+                  left:
+                      0,
+                  right:
+                      0,
+                  bottom:
+                      0,
+                  height:
+                      flowerBedHeight,
+                  child:
+                      IgnorePointer(
+                    child:
+                        Image.asset(
+                      'assets/images/flower.png',
+                      fit:
+                          BoxFit.fitWidth,
+                      alignment:
+                          Alignment.bottomCenter,
                     ),
-                    const CircularProgressIndicator(),
-                  ],
+                  ),
+                ),
 
-                  if (errorMessage !=
-                      null) ...[
-                    const SizedBox(
-                      height:
-                          20,
-                    ),
+                // ------------------------------------------------
+                // MANUAL DEBUG BUTTON
+                // ------------------------------------------------
 
-                    Text(
-                      errorMessage!,
-                      textAlign:
-                          TextAlign.center,
-                    ),
-                  ],
-
-                  if (tagResult !=
-                      null) ...[
-                    const SizedBox(
-                      height:
-                          30,
-                    ),
-
-                    Text(
-                      'User ID：'
-                      '${tagResult!.userInfo.userId}',
-                    ),
-
-                    Text(
-                      'ユニークアドレス数：'
-                      '${tagResult!.uniqueAddresses.length}',
-                    ),
-
-                    const SizedBox(
-                      height:
-                          25,
-                    ),
-
-                    Text(
-                      flowerEmoji,
-                      style:
-                          const TextStyle(
-                        fontSize:
-                            140,
+                Positioned(
+                  top:
+                      18,
+                  left:
+                      18,
+                  child:
+                      Opacity(
+                    opacity:
+                        0.35,
+                    child:
+                        IconButton(
+                      tooltip:
+                          'タグフォルダを手動選択',
+                      onPressed:
+                          isLoading
+                              ? null
+                              : selectTagFolder,
+                      icon:
+                          const Icon(
+                        Icons.folder_open,
                       ),
                     ),
+                  ),
+                ),
 
-                    Text(
-                      '現在の花：'
-                      '$currentFlowerId',
-                      style:
-                          const TextStyle(
-                        fontSize:
-                            24,
-                        fontWeight:
-                            FontWeight.bold,
+                // ------------------------------------------------
+                // ERROR
+                // ------------------------------------------------
+
+                if (errorMessage !=
+                    null)
+                  Positioned(
+                    left:
+                        30,
+                    right:
+                        30,
+                    bottom:
+                        flowerBedHeight + 12,
+                    child:
+                        Container(
+                      padding:
+                          const EdgeInsets.all(
+                        16,
                       ),
-                    ),
-
-                    Text(
-                      'Stage '
-                      '$currentStage',
-                      style:
-                          const TextStyle(
-                        fontSize:
-                            26,
+                      decoration:
+                          BoxDecoration(
+                        color:
+                            const Color(
+                          0xFFFFF1F0,
+                        ),
+                        borderRadius:
+                            BorderRadius.circular(
+                          18,
+                        ),
+                        border:
+                            Border.all(
+                          color:
+                              const Color(
+                            0xFFC95A50,
+                          ),
+                        ),
                       ),
-                    ),
-
-                    Text(
-                      stageMessage,
-                    ),
-
-                    if (bloomedFlowerId !=
-                        null) ...[
-                      const SizedBox(
-                        height:
-                            15,
-                      ),
-
-                      Text(
-                        '🌸 '
-                        '$bloomedFlowerId '
-                        'が開花しました！',
+                      child:
+                          Text(
+                        errorMessage!,
+                        textAlign:
+                            TextAlign.center,
                         style:
                             const TextStyle(
                           fontSize:
-                              22,
+                              16,
                           fontWeight:
-                              FontWeight.bold,
+                              FontWeight.w600,
+                          color:
+                              Color(
+                            0xFF7D2922,
+                          ),
                         ),
                       ),
-                    ],
-
-                    const SizedBox(
-                      height:
-                          25,
                     ),
-
-                    Text(
-                      'Checkpoint：'
-                      '${checkpointHits.length}',
-                    ),
-
-                    Text(
-                      '交流：'
-                      '${interactionHits.length}',
-                    ),
-
-                    Text(
-                      '所持種：'
-                      '${seedInventory.length}',
-                    ),
-
-                    Text(
-                      '削除LOG：'
-                      '$deletedLogCount',
-                    ),
-
-                    const SizedBox(
-                      height:
-                          40,
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ),
+                  ),
+              ],
+            );
+          },
         ),
       ),
     );
