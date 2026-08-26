@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -13,6 +14,7 @@ import 'services/tag_folder_service.dart';
 import 'services/usb_monitor_service.dart';
 import 'services/safe_eject_service.dart';
 import 'services/log_parser.dart';
+
 
 enum SignageViewState {
   waiting,
@@ -35,14 +37,10 @@ class FlowerSignageApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
+    return const MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Flower Signage',
-      theme: ThemeData(
-        useMaterial3: true,
-        fontFamily: 'sans-serif',
-      ),
-      home: const TagFolderScreen(),
+      home: TagFolderScreen(),
     );
   }
 }
@@ -83,9 +81,43 @@ class _TagFolderScreenState
 
   List<Map<String, Object?>> seedInventory = [];
 
-  Map<String, Object?>? activeFlower;
+  // 7種類の表示順。DB/asset/configのflower_idもこの表記で統一する。
+  static const List<String> flowerIds = [
+    'tulip',
+    'sunflower',
+    'rose',
+    'kernation',
+    'suzuran',
+    'ajisai',
+    'cosmos',
+  ];
 
-  String? bloomedFlowerId;
+  // 花ごとの開花Stage。
+  static const Map<String, int> flowerMaxStages = {
+    'tulip': 6,
+    'sunflower': 6,
+    'rose': 6,
+    'kernation': 6,
+    'suzuran': 6,
+    'ajisai': 5,
+    'cosmos': 4,
+  };
+
+  // DB上の現在育成中の花。
+  Map<String, Map<String, Object?>> activeFlowersByType = {};
+
+  // 結果画面に表示するStage。
+  // 開花して次の花へStageが繰り越された場合も、今回の画面では開花Stageを保持する。
+  Map<String, int> resultDisplayStages = {};
+
+  // 今回その花に加算したStage数。
+  Map<String, int> resultStageDeltas = {};
+
+  // 花ごとの累計開花数。
+  Map<String, int> bloomCounts = {};
+
+  // 花ごとの未使用種数。
+  Map<String, int> unusedSeedCounts = {};
 
   final List<String> newlyAddedSeeds = [];
   final List<String> alreadyOwnedSeeds = [];
@@ -105,6 +137,14 @@ class _TagFolderScreenState
 
   int deletedLogCount = 0;
 
+  SignageViewState signageViewState =
+      SignageViewState.waiting;
+
+  int lastStageDelta = 0;
+
+  Timer? _resultDisplayTimer;
+  Timer? _returnToWaitingTimer;
+
   // ============================================================
   // USB
   // ============================================================
@@ -115,17 +155,6 @@ class _TagFolderScreenState
       'BLEタグを接続してください';
 
   bool isAutoProcessing = false;
-  bool isSafeEjecting = false;
-
-  // ============================================================
-  // SIGNAGE UI
-  // ============================================================
-
-  SignageViewState signageViewState =
-      SignageViewState.waiting;
-
-  String? uiFlowerId;
-  int uiStage = 0;
 
   // ============================================================
   // INIT
@@ -225,9 +254,6 @@ class _TagFolderScreenState
 
         registeredUsers =
             loadedUsers;
-
-        signageViewState =
-            SignageViewState.waiting;
       });
 
       _startUsbMonitor();
@@ -305,10 +331,15 @@ class _TagFolderScreenState
             return;
           }
 
+          _resultDisplayTimer?.cancel();
+          _returnToWaitingTimer?.cancel();
+
           setState(() {
+            signageViewState =
+                SignageViewState.processing;
+
             usbStatus =
-                'BLEタグを検出しました\n'
-                'データを処理しています...';
+                'タグを抜かないでください';
 
             processStatus =
                 'USBタグ検出';
@@ -318,9 +349,6 @@ class _TagFolderScreenState
 
             deletedLogCount =
                 0;
-
-            signageViewState =
-                SignageViewState.processing;
           });
 
           await _processTagFolder(
@@ -342,38 +370,25 @@ class _TagFolderScreenState
 
             processStatus =
                 'USB安全取り外し中';
-
-            signageViewState =
-                SignageViewState.processing;
           });
 
-          isSafeEjecting = true;
+          await SafeEjectService.eject(
+            folderPath,
+          );
 
-          try {
-            await SafeEjectService.eject(
-              folderPath,
-            );
+          // 物理抜線は待たない。
+          // 現在タグの監視状態を解除し、次に検出されたタグを
+          // 新しい処理対象として受け付ける。
+          usbMonitor?.completeSafeEject();
 
-            if (!mounted) {
-              return;
-            }
-
-            setState(() {
-              usbStatus =
-                  '処理が完了しました\n'
-                  'タグを抜いてください';
-
-              processStatus =
-                  '安全に取り外しました';
-
-              signageViewState =
-                  SignageViewState.complete;
-            });
-          } catch (_) {
-            isSafeEjecting = false;
-
-            rethrow;
+          if (!mounted) {
+            return;
           }
+
+          // Eject完了後に結果を表示する。
+          // 結果表示中でも新しいタグを検出したら、
+          // onTagConnected側でタイマーを止めてPROCESSINGへ移る。
+          _showResultAfterSafeEject();
         } catch (e, stackTrace) {
           if (config!.debugLogging) {
             debugPrint(
@@ -410,7 +425,7 @@ class _TagFolderScreenState
       onTagDisconnected: () {
         if (config!.debugLogging) {
           debugPrint(
-            'USB DISCONNECTED',
+            'USB PHYSICALLY DISCONNECTED',
           );
         }
 
@@ -419,40 +434,62 @@ class _TagFolderScreenState
         }
 
         // ========================================================
-        // 正常Ejectによる切断
+        // Eject前に予期せずStorageが切断された場合の復帰処理。
+        // 正常Eject後は物理抜線を追跡しない。
         // ========================================================
 
-        if (isSafeEjecting) {
-          isSafeEjecting = false;
-
-          setState(() {
-            usbStatus =
-                '処理が完了しました\n'
-                'タグを抜いてください';
-
-            processStatus =
-                '安全に取り外しました';
-
-            signageViewState =
-                SignageViewState.complete;
-          });
-
-          return;
-        }
-
-        // ========================================================
-        // ユーザーが物理的に抜いた / 異常切断
-        // ========================================================
+        _resultDisplayTimer?.cancel();
+        _returnToWaitingTimer?.cancel();
 
         setState(() {
+          signageViewState =
+              SignageViewState.waiting;
+
           usbStatus =
-              'BLEタグを接続してください';
+              'タグを接続してください';
 
           processStatus =
               '待機中';
 
-          signageViewState =
-              SignageViewState.waiting;
+          errorMessage =
+              null;
+
+          tagResult =
+              null;
+
+          checkpointHits =
+              [];
+
+          interactionHits =
+              [];
+
+          seedInventory =
+              [];
+
+          activeFlowersByType = {};
+          resultDisplayStages = {};
+          resultStageDeltas = {};
+          bloomCounts = {};
+          unusedSeedCounts = {};
+
+          newlyAddedSeeds.clear();
+          alreadyOwnedSeeds.clear();
+
+          alreadyImported =
+              false;
+
+          currentImportHash =
+              null;
+
+          deletedLogCount =
+              0;
+
+          lastStageDelta =
+              0;
+
+          isLoading =
+              false;
+
         });
       },
     );
@@ -463,6 +500,8 @@ class _TagFolderScreenState
   @override
   void dispose() {
     usbMonitor?.stop();
+    _resultDisplayTimer?.cancel();
+    _returnToWaitingTimer?.cancel();
 
     super.dispose();
   }
@@ -480,6 +519,19 @@ class _TagFolderScreenState
 
       if (folderPath == null) {
         return;
+      }
+
+      if (mounted) {
+        _resultDisplayTimer?.cancel();
+        _returnToWaitingTimer?.cancel();
+
+        setState(() {
+          signageViewState =
+              SignageViewState.processing;
+
+          usbStatus =
+              'タグを抜かないでください';
+        });
       }
 
       await _processTagFolder(
@@ -543,8 +595,11 @@ class _TagFolderScreenState
 
         seedInventory = [];
 
-        activeFlower = null;
-        bloomedFlowerId = null;
+        activeFlowersByType = {};
+        resultDisplayStages = {};
+        resultStageDeltas = {};
+        bloomCounts = {};
+        unusedSeedCounts = {};
 
         newlyAddedSeeds.clear();
         alreadyOwnedSeeds.clear();
@@ -555,14 +610,13 @@ class _TagFolderScreenState
 
         deletedLogCount = 0;
 
+        lastStageDelta = 0;
+
         selectedFolder =
             folderPath;
 
         processStatus =
             '[1] LOG読込中';
-
-        signageViewState =
-            SignageViewState.processing;
       });
     }
 
@@ -605,14 +659,14 @@ class _TagFolderScreenState
           result.userInfo.macAddress,
     );
 
-    await DatabaseService.instance
-        .ensureInitialSeeds(
-      userId:
-          result.userInfo.userId,
+    // await DatabaseService.instance
+    //     .ensureInitialSeeds(
+    //   userId:
+    //       result.userInfo.userId,
 
-      initialSeeds:
-          cfg.initialSeeds,
-    );
+    //   initialSeeds:
+    //       cfg.initialSeeds,
+    // );
 
     if (cfg.debugLogging) {
       debugPrint(
@@ -640,19 +694,16 @@ class _TagFolderScreenState
     // ==========================================================
 
     if (result.logFiles.isEmpty) {
-      // 現在育成中の花を確認
-      var currentFlower =
-          await DatabaseService.instance
-              .getActiveFlower(
+      final currentFlowers =
+          await DatabaseService.instance.getActiveFlowersByType(
         result.userInfo.userId,
       );
-
-      // 初回ユーザーなど、
-      // まだ育成中の花がなければ
-      // 最初の初期種をStage 0で育成開始
-      currentFlower ??=
-          await DatabaseService.instance
-              .activateNextSeed(
+      final currentBloomCounts =
+          await DatabaseService.instance.getBloomCounts(
+        result.userInfo.userId,
+      );
+      final currentUnusedSeedCounts =
+          await DatabaseService.instance.getUnusedSeedCounts(
         result.userInfo.userId,
       );
 
@@ -673,17 +724,17 @@ class _TagFolderScreenState
         seedInventory =
             seeds;
 
-        activeFlower =
-            currentFlower;
+        activeFlowersByType = currentFlowers;
+        resultDisplayStages = {
+          for (final entry in currentFlowers.entries)
+            entry.key: (entry.value['stage'] as num?)?.toInt() ?? 0,
+        };
+        resultStageDeltas = {};
+        bloomCounts = currentBloomCounts;
+        unusedSeedCounts = currentUnusedSeedCounts;
 
-        checkpointHits =
-            [];
-
-        interactionHits =
-            [];
-
-        bloomedFlowerId =
-            null;
+        checkpointHits = [];
+        interactionHits = [];
 
         alreadyImported =
             false;
@@ -721,8 +772,7 @@ class _TagFolderScreenState
         );
 
         debugPrint(
-          'Active flower = '
-          '${currentFlower?['flower_id']}',
+          'Active flowers = $currentFlowers',
         );
 
         debugPrint(
@@ -873,9 +923,16 @@ class _TagFolderScreenState
         result.userInfo.userId,
       );
 
-      final currentFlower =
-          await DatabaseService.instance
-              .getActiveFlower(
+      final currentFlowers =
+          await DatabaseService.instance.getActiveFlowersByType(
+        result.userInfo.userId,
+      );
+      final currentBloomCounts =
+          await DatabaseService.instance.getBloomCounts(
+        result.userInfo.userId,
+      );
+      final currentUnusedSeedCounts =
+          await DatabaseService.instance.getUnusedSeedCounts(
         result.userInfo.userId,
       );
 
@@ -890,17 +947,17 @@ class _TagFolderScreenState
         seedInventory =
             seeds;
 
-        activeFlower =
-            currentFlower;
+        activeFlowersByType = currentFlowers;
+        resultDisplayStages = {
+          for (final entry in currentFlowers.entries)
+            entry.key: (entry.value['stage'] as num?)?.toInt() ?? 0,
+        };
+        resultStageDeltas = {};
+        bloomCounts = currentBloomCounts;
+        unusedSeedCounts = currentUnusedSeedCounts;
 
-        checkpointHits =
-            [];
-
-        interactionHits =
-            [];
-
-        bloomedFlowerId =
-            null;
+        checkpointHits = [];
+        interactionHits = [];
 
         alreadyImported =
             true;
@@ -958,7 +1015,7 @@ class _TagFolderScreenState
     final importHash =
         await ImportService
             .createImportHash(
-      result.logFiles,
+      newLogFiles,
     );
 
     currentImportHash =
@@ -1012,9 +1069,16 @@ class _TagFolderScreenState
         result.userInfo.userId,
       );
 
-      final currentFlower =
-          await DatabaseService.instance
-              .getActiveFlower(
+      final currentFlowers =
+          await DatabaseService.instance.getActiveFlowersByType(
+        result.userInfo.userId,
+      );
+      final currentBloomCounts =
+          await DatabaseService.instance.getBloomCounts(
+        result.userInfo.userId,
+      );
+      final currentUnusedSeedCounts =
+          await DatabaseService.instance.getUnusedSeedCounts(
         result.userInfo.userId,
       );
 
@@ -1047,8 +1111,14 @@ class _TagFolderScreenState
         seedInventory =
             seeds;
 
-        activeFlower =
-            currentFlower;
+        activeFlowersByType = currentFlowers;
+        resultDisplayStages = {
+          for (final entry in currentFlowers.entries)
+            entry.key: (entry.value['stage'] as num?)?.toInt() ?? 0,
+        };
+        resultStageDeltas = {};
+        bloomCounts = currentBloomCounts;
+        unusedSeedCounts = currentUnusedSeedCounts;
 
         alreadyImported =
             true;
@@ -1205,13 +1275,21 @@ class _TagFolderScreenState
       });
     }
 
+    lastStageDelta =
+        GrowthService.calculateStage(
+      value:
+          growthValue,
+      config:
+          cfg,
+    );
+
     final flowerResult =
         await _processFlowerGrowth(
-      userId:
-          result.userInfo.userId,
-
-      growthValue:
-          growthValue,
+      userId: result.userInfo.userId,
+      growthValue: growthValue,
+      importHash: importHash,
+      checkpointHits: uniqueCheckpointHits,
+      interactionHits: uniqueInteractions,
     );
 
     // ==========================================================
@@ -1451,11 +1529,11 @@ class _TagFolderScreenState
       seedInventory =
           seeds;
 
-      activeFlower =
-          flowerResult.activeFlower;
-
-      bloomedFlowerId =
-          flowerResult.bloomedFlowerId;
+      activeFlowersByType = flowerResult.activeFlowers;
+      resultDisplayStages = flowerResult.displayStages;
+      resultStageDeltas = flowerResult.stageDeltas;
+      bloomCounts = flowerResult.bloomCounts;
+      unusedSeedCounts = flowerResult.unusedSeedCounts;
 
       alreadyImported =
           false;
@@ -1470,20 +1548,7 @@ class _TagFolderScreenState
 
       isLoading =
           false;
-
-      uiFlowerId =
-          flowerResult.activeFlower?['flower_id']
-              ?.toString();
-
-      uiStage =
-          (flowerResult.activeFlower?['stage'] as num?)
-                  ?.toInt() ??
-              0;
     });
-
-    await _playResultPresentation(
-      flowerResult,
-    );
 
     if (cfg.debugLogging) {
       debugPrint(
@@ -1498,15 +1563,10 @@ class _TagFolderScreenState
         'Growth value = $growthValue',
       );
 
-      debugPrint(
-        'Bloomed flower = '
-        '$bloomedFlowerId',
-      );
-
-      debugPrint(
-        'Active flower = '
-        '${activeFlower?['flower_id']}',
-      );
+      debugPrint('Result display stages = $resultDisplayStages');
+      debugPrint('Stage deltas = $resultStageDeltas');
+      debugPrint('Bloom counts = $bloomCounts');
+      debugPrint('Unused seed counts = $unusedSeedCounts');
 
       debugPrint(
         'Deleted LOG = $deleted',
@@ -1624,777 +1684,1648 @@ class _TagFolderScreenState
 
   // ============================================================
   // FLOWER PROCESS
+  //
+  // ・1回の接続で対象になった花をすべて独立して成長させる。
+  // ・Checkpoint/交流が1件以上ある場合は、その結果に対応する花が対象。
+  // ・Checkpoint/交流が0件の場合はcosmosが対象。
+  // ・同じ接続で同じflower_idが複数回出ても成長加算は1回だけ。
+  // ・開花してStageが余った場合は同種の次の種へ繰り越す。
+  // ・結果画面は今回開花した画像を保持し、次の花は次回から表示する。
   // ============================================================
 
-  Future<FlowerProcessResult>
-      _processFlowerGrowth({
+  Future<FlowerProcessResult> _processFlowerGrowth({
     required String userId,
     required int growthValue,
+    required String importHash,
+    required List<CheckpointHit> checkpointHits,
+    required List<InteractionHit> interactionHits,
   }) async {
     if (config == null) {
-      throw Exception(
-        'Configがありません。',
+      throw Exception('Configがありません。');
+    }
+
+    final stageDelta =
+        GrowthService.calculateStage(
+      value: growthValue,
+      config: config!,
+    );
+
+    final targetFlowerIds =
+        <String>{};
+
+    for (final hit in checkpointHits) {
+      final flowerId =
+          hit.checkpoint.flower.trim();
+
+      if (flowerMaxStages.containsKey(
+        flowerId,
+      )) {
+        targetFlowerIds.add(
+          flowerId,
+        );
+      }
+    }
+
+    for (final hit in interactionHits) {
+      final flowerId =
+          hit.user.flower.trim();
+
+      if (flowerMaxStages.containsKey(
+        flowerId,
+      )) {
+        targetFlowerIds.add(
+          flowerId,
+        );
+      }
+    }
+
+    if (targetFlowerIds.isEmpty) {
+      targetFlowerIds.add(
+        'cosmos',
+      );
+
+      await DatabaseService.instance
+          .addSeed(
+        userId: userId,
+        flowerId: 'cosmos',
+        sourceType: 'activity',
+        sourceId: 'cosmos:$importHash',
       );
     }
 
-    
+    final displayStages =
+        <String, int>{};
 
-    // ==========================================================
-    // 今回のデータが何段階分の成長に相当するか
-    //
-    // 例:
-    //   0〜298   -> 0段階
-    //   299〜599 -> 1段階
-    //   600〜999 -> 2段階
-    //   1000〜   -> 3段階
-    // ==========================================================
+    final stageDeltas =
+        <String, int>{};
 
-    int remainingStages =
-        GrowthService.calculateStage(
-      value:
-          growthValue,
-      config:
-          config!,
+    final beforeActive =
+        await DatabaseService.instance
+            .getActiveFlowersByType(
+      userId,
     );
+
+    for (final entry
+        in beforeActive.entries) {
+      displayStages[entry.key] =
+          (entry.value['stage']
+                      as num?)
+                  ?.toInt() ??
+              0;
+    }
+
+    for (final flowerId
+        in targetFlowerIds) {
+      final maxStage =
+          flowerMaxStages[flowerId]!;
+
+      stageDeltas[flowerId] =
+          stageDelta;
+
+      var remainingStages =
+          stageDelta;
+
+      var remainingGrowthValue =
+          growthValue;
+
+      var current =
+          await DatabaseService.instance
+              .getActiveFlowerByType(
+        userId: userId,
+        flowerId: flowerId,
+      );
+
+      if (remainingStages <= 0) {
+        displayStages[flowerId] =
+            (current?['stage']
+                        as num?)
+                    ?.toInt() ??
+                0;
+        continue;
+      }
+
+      current ??=
+          await DatabaseService.instance
+              .activateNextSeedForFlower(
+        userId: userId,
+        flowerId: flowerId,
+        initialStage: 0,
+        initialGrowthValue: 0,
+      );
+
+      if (current == null) {
+        displayStages.putIfAbsent(
+          flowerId,
+          () => 0,
+        );
+        continue;
+      }
+
+      bool bloomedThisConnection =
+          false;
+
+      final totalStageDelta =
+          stageDelta;
+
+      while (remainingStages > 0 &&
+          current != null) {
+        final userFlowerId =
+            (current['id'] as num)
+                .toInt();
+
+        final currentStage =
+            (current['stage']
+                        as num?)
+                    ?.toInt() ??
+                0;
+
+        final currentGrowthValue =
+            (current['growth_value']
+                        as num?)
+                    ?.toInt() ??
+                0;
+
+        final stagesToBloom =
+            maxStage -
+                currentStage;
+
+        if (stagesToBloom <= 0) {
+          await DatabaseService.instance
+              .markFlowerBloomed(
+            userFlowerId:
+                userFlowerId,
+            growthValue:
+                currentGrowthValue,
+            maxStage:
+                maxStage,
+          );
+
+          bloomedThisConnection =
+              true;
+
+          displayStages[flowerId] =
+              maxStage;
+
+          current =
+              await DatabaseService.instance
+                  .activateNextSeedForFlower(
+            userId:
+                userId,
+            flowerId:
+                flowerId,
+            initialStage:
+                0,
+            initialGrowthValue:
+                0,
+          );
+
+          if (current == null) {
+            remainingStages = 0;
+            remainingGrowthValue = 0;
+          }
+
+          continue;
+        }
+
+        final stagesAppliedToCurrent =
+            remainingStages <
+                    stagesToBloom
+                ? remainingStages
+                : stagesToBloom;
+
+        final int growthAppliedToCurrent;
+
+        if (stagesAppliedToCurrent ==
+                remainingStages ||
+            totalStageDelta <= 0) {
+          growthAppliedToCurrent =
+              remainingGrowthValue;
+        } else {
+          final proportional =
+              (growthValue *
+                      stagesAppliedToCurrent /
+                      totalStageDelta)
+                  .round();
+
+          growthAppliedToCurrent =
+              proportional
+                  .clamp(
+                    0,
+                    remainingGrowthValue,
+                  )
+                  .toInt();
+        }
+
+        final newGrowthValue =
+            currentGrowthValue +
+                growthAppliedToCurrent;
+
+        final newStage =
+            currentStage +
+                stagesAppliedToCurrent;
+
+        remainingStages -=
+            stagesAppliedToCurrent;
+
+        remainingGrowthValue -=
+            growthAppliedToCurrent;
+
+        if (newStage < maxStage) {
+          await DatabaseService.instance
+              .updateFlowerGrowth(
+            userFlowerId:
+                userFlowerId,
+            growthValue:
+                newGrowthValue,
+            stage:
+                newStage,
+          );
+
+          if (!bloomedThisConnection) {
+            displayStages[flowerId] =
+                newStage;
+          }
+
+          if (remainingStages > 0) {
+            current =
+                await DatabaseService.instance
+                    .getFlowerById(
+              userFlowerId,
+            );
+          } else {
+            current = null;
+          }
+
+          continue;
+        }
+
+        await DatabaseService.instance
+            .markFlowerBloomed(
+          userFlowerId:
+              userFlowerId,
+          growthValue:
+              newGrowthValue,
+          maxStage:
+              maxStage,
+        );
+
+        bloomedThisConnection =
+            true;
+
+        displayStages[flowerId] =
+            maxStage;
+
+        if (remainingStages > 0) {
+          current =
+              await DatabaseService.instance
+                  .activateNextSeedForFlower(
+            userId:
+                userId,
+            flowerId:
+                flowerId,
+            initialStage:
+                0,
+            initialGrowthValue:
+                0,
+          );
+
+          if (current == null) {
+            remainingStages = 0;
+            remainingGrowthValue = 0;
+          }
+        } else {
+          current = null;
+        }
+      }
+    }
+
+    final activeFlowers =
+        await DatabaseService.instance
+            .getActiveFlowersByType(
+      userId,
+    );
+
+    final currentBloomCounts =
+        await DatabaseService.instance
+            .getBloomCounts(
+      userId,
+    );
+
+    final currentUnusedSeedCounts =
+        await DatabaseService.instance
+            .getUnusedSeedCounts(
+      userId,
+    );
+
+    for (final entry
+        in activeFlowers.entries) {
+      displayStages.putIfAbsent(
+        entry.key,
+        () =>
+            (entry.value['stage']
+                        as num?)
+                    ?.toInt() ??
+                0,
+      );
+    }
 
     if (config!.debugLogging) {
       debugPrint(
         '================================',
       );
-
       debugPrint(
-        '=== FLOWER STAGE GROWTH ===',
+        '=== MULTI FLOWER GROWTH ===',
       );
-
       debugPrint(
         'Growth value = $growthValue',
       );
-
       debugPrint(
-        'Stage delta = $remainingStages',
+        'Stage delta = $stageDelta',
       );
-
+      debugPrint(
+        'Targets = $targetFlowerIds',
+      );
+      debugPrint(
+        'Display stages = $displayStages',
+      );
+      debugPrint(
+        'Active flowers = ${activeFlowers.keys.toList()}',
+      );
+      debugPrint(
+        'Bloom counts = $currentBloomCounts',
+      );
+      debugPrint(
+        'Unused seeds = $currentUnusedSeedCounts',
+      );
       debugPrint(
         '================================',
       );
     }
 
-    // ==========================================================
-    // 現在育成中の花
-    // ==========================================================
-
-    var current =
-        await DatabaseService.instance
-            .getActiveFlower(
-      userId,
-    );
-
-    // 現在の花がなければ、
-    // 一番古い未使用種を開始
-    current ??=
-        await DatabaseService.instance
-            .activateNextSeed(
-      userId,
-    );
-
-    // 種自体がない
-    if (current == null) {
-      return const FlowerProcessResult(
-        activeFlower:
-            null,
-        bloomedFlowerId:
-            null,
-      );
-    }
-
-    // 今回Stage 0相当なら
-    // 現在の状態を変更しない
-    if (remainingStages <= 0) {
-      return FlowerProcessResult(
-        activeFlower:
-            current,
-        bloomedFlowerId:
-            null,
-      );
-    }
-
-    String? bloomedFlowerId;
-
-    // ==========================================================
-    // 段階数を順番に消費する
-    // ==========================================================
-
-    while (remainingStages > 0 &&
-        current != null) {
-      final userFlowerId =
-          (current['id'] as num)
-              .toInt();
-
-      final flowerId =
-          current['flower_id']
-              .toString();
-
-      final currentStage =
-          (current['stage'] as num?)
-                  ?.toInt() ??
-              0;
-
-      // 開花まであと何段階必要か
-      final stagesToBloom =
-          3 - currentStage;
-
-      if (config!.debugLogging) {
-        debugPrint(
-          'Flower = $flowerId',
-        );
-
-        debugPrint(
-          'Current stage = '
-          '$currentStage',
-        );
-
-        debugPrint(
-          'Remaining stages = '
-          '$remainingStages',
-        );
-
-        debugPrint(
-          'Stages to bloom = '
-          '$stagesToBloom',
-        );
-      }
-
-      // ========================================================
-      // 今回の残り段階だけでは開花しない
-      // ========================================================
-
-      if (remainingStages <
-          stagesToBloom) {
-        final newStage =
-            currentStage +
-                remainingStages;
-
-        await DatabaseService.instance
-            .updateFlowerGrowth(
-          userFlowerId:
-              userFlowerId,
-
-          growthValue:
-              _growthValueForStage(
-            newStage,
-          ),
-
-          stage:
-              newStage,
-        );
-
-        remainingStages = 0;
-
-        current =
-            await DatabaseService.instance
-                .getFlowerById(
-          userFlowerId,
-        );
-
-        if (config!.debugLogging) {
-          debugPrint(
-            'Flower stage updated: '
-            '$currentStage -> $newStage',
-          );
-        }
-
-        break;
-      }
-
-      // ========================================================
-      // 現在の花が開花する
-      // ========================================================
-
-      remainingStages -=
-          stagesToBloom;
-
-      await DatabaseService.instance
-          .markFlowerBloomed(
-        userFlowerId:
-            userFlowerId,
-
-        growthValue:
-            _growthValueForStage(
-          3,
-        ),
-      );
-
-      bloomedFlowerId =
-          flowerId;
-
-      if (config!.debugLogging) {
-        debugPrint(
-          'Flower bloomed: '
-          '$flowerId',
-        );
-
-        debugPrint(
-          'Remaining stages after bloom = '
-          '$remainingStages',
-        );
-      }
-
-      // ========================================================
-      // 次の種を育成開始
-      // ========================================================
-
-      current =
-          await DatabaseService.instance
-              .activateNextSeed(
-        userId,
-      );
-
-      // 次の種がなければ、
-      // 余った段階はここで終了
-      if (current == null) {
-        if (config!.debugLogging) {
-          debugPrint(
-            'No next seed.',
-          );
-
-          debugPrint(
-            'Unused stages = '
-            '$remainingStages',
-          );
-        }
-
-        remainingStages = 0;
-
-        break;
-      }
-    }
-
     return FlowerProcessResult(
-      activeFlower:
-          current,
-
-      bloomedFlowerId:
-          bloomedFlowerId,
+      activeFlowers:
+          activeFlowers,
+      displayStages:
+          displayStages,
+      stageDeltas:
+          stageDeltas,
+      bloomCounts:
+          currentBloomCounts,
+      unusedSeedCounts:
+          currentUnusedSeedCounts,
     );
   }
 
-  // ★ この位置に置く
-  int _growthValueForStage(
-    int stage,
-  ) {
-    if (config == null) {
-      return 0;
-    }
-
-    switch (stage) {
-      case 0:
-        return 0;
-
-      case 1:
-        return config!.stage1Threshold;
-
-      case 2:
-        return config!.stage2Threshold;
-
-      case 3:
-        return config!.stage3Threshold;
-
-      default:
-        return 0;
-    }
-  }
-  
   // ============================================================
-  // CURRENT VALUES
+  // SIGNAGE RESULT CONTROL
   // ============================================================
 
-  int get growthValue {
-    if (tagResult == null) {
-      return 0;
-    }
+  void _showResultAfterSafeEject() {
+    _resultDisplayTimer?.cancel();
+    _returnToWaitingTimer?.cancel();
 
-    return tagResult!
-        .uniqueAddresses
-        .length;
-  }
-
-  int get currentStage {
-    if (activeFlower == null) {
-      return 0;
-    }
-
-    return (activeFlower!['stage']
-                as num?)
-            ?.toInt() ??
-        0;
-  }
-
-  String get currentFlowerId {
-    if (activeFlower == null) {
-      return 'なし';
-    }
-
-    return activeFlower![
-            'flower_id']
-        .toString();
-  }
-
-  // ============================================================
-  // SIGNAGE UI HELPERS
-  // ============================================================
-
-  String _flowerAsset(
-    String flowerId,
-    String suffix,
-  ) {
-    return 'assets/images/'
-        '${flowerId}_$suffix.png';
-  }
-
-  Widget _buildFlowerStage({
-    required String flowerId,
-    required int stage,
-    double height = 320,
-  }) {
-    if (flowerId.isEmpty ||
-        flowerId == 'なし') {
-      return SizedBox(
-        height: height,
-        child: const Center(
-          child: Icon(
-            Icons.local_florist_outlined,
-            size: 110,
-          ),
-        ),
-      );
-    }
-
-    switch (stage) {
-      case 0:
-        return SizedBox(
-          height: height,
-          child: Center(
-            child: Image.asset(
-              _flowerAsset(
-                flowerId,
-                'seed',
-              ),
-              height: height * 0.42,
-              fit: BoxFit.contain,
-            ),
-          ),
-        );
-
-      case 1:
-        return SizedBox(
-          height: height,
-          child: Center(
-            child: Image.asset(
-              _flowerAsset(
-                flowerId,
-                'mini',
-              ),
-              height: height * 0.68,
-              fit: BoxFit.contain,
-            ),
-          ),
-        );
-
-      case 2:
-        return SizedBox(
-          height: height,
-          width: height * 0.9,
-          child: Stack(
-            alignment: Alignment.center,
-            children: [
-              Positioned(
-                bottom: 0,
-                child: Image.asset(
-                  _flowerAsset(
-                    flowerId,
-                    'big',
-                  ),
-                  height: height * 0.82,
-                  fit: BoxFit.contain,
-                ),
-              ),
-              Positioned(
-                top: height * 0.01,
-                child: Image.asset(
-                  _flowerAsset(
-                    flowerId,
-                    'befoflo',
-                  ),
-                  height: height * 0.36,
-                  fit: BoxFit.contain,
-                ),
-              ),
-            ],
-          ),
-        );
-
-      case 3:
-        return SizedBox(
-          height: height,
-          width: height * 0.9,
-          child: Stack(
-            alignment: Alignment.center,
-            children: [
-              Positioned(
-                bottom: 0,
-                child: Image.asset(
-                  _flowerAsset(
-                    flowerId,
-                    'big',
-                  ),
-                  height: height * 0.82,
-                  fit: BoxFit.contain,
-                ),
-              ),
-              Positioned(
-                top: 0,
-                child: Image.asset(
-                  'assets/images/'
-                  '$flowerId.png',
-                  height: height * 0.40,
-                  fit: BoxFit.contain,
-                ),
-              ),
-            ],
-          ),
-        );
-
-      default:
-        return const SizedBox();
-    }
-  }
-
-  Future<void> _playResultPresentation(
-    FlowerProcessResult flowerResult,
-  ) async {
     if (!mounted) {
       return;
     }
 
-    final bloomedId =
-        flowerResult.bloomedFlowerId;
+    setState(() {
+      usbStatus = '結果表示中';
+      processStatus = '結果表示中';
+      signageViewState = SignageViewState.growth;
+    });
 
-    if (bloomedId != null) {
-      setState(() {
-        signageViewState =
-            SignageViewState.bloom;
+    // ----------------------------------------------------------
+    // 1) 結果画面を30秒表示
+    // ----------------------------------------------------------
+    _resultDisplayTimer = Timer(
+      const Duration(seconds: 30),
+      () {
+        if (!mounted) {
+          return;
+        }
 
-        uiFlowerId =
-            bloomedId;
-
-        uiStage =
-            3;
-      });
-
-      await Future<void>.delayed(
-        const Duration(
-          milliseconds: 1800,
-        ),
-      );
-
-      if (!mounted) {
-        return;
-      }
-    }
-
-    final nextFlower =
-        flowerResult.activeFlower;
-
-    if (nextFlower != null) {
-      final nextStage =
-          (nextFlower['stage'] as num?)
-                  ?.toInt() ??
-              0;
-
-      if (bloomedId == null ||
-          nextStage > 0) {
         setState(() {
           signageViewState =
-              SignageViewState.growth;
+              SignageViewState.complete;
 
-          uiFlowerId =
-              nextFlower['flower_id']
-                  ?.toString();
+          usbStatus =
+              '抜いても大丈夫です';
 
-          uiStage =
-              nextStage;
+          processStatus =
+              '取り外し可能';
         });
 
-        await Future<void>.delayed(
-          const Duration(
-            milliseconds: 1400,
-          ),
+        // ------------------------------------------------------
+        // 2) 「抜いても大丈夫です」を15秒表示
+        // ------------------------------------------------------
+        _returnToWaitingTimer?.cancel();
+
+        _returnToWaitingTimer = Timer(
+          const Duration(seconds: 15),
+          () {
+            if (!mounted) {
+              return;
+            }
+
+            // UIだけ待機へ戻す。
+            //
+            // USB監視側の「同じタグを再処理しない」状態は
+            // ここではリセットしない。
+            // 次に新しいタグが検出されたときだけ処理を開始する。
+            setState(() {
+              signageViewState =
+                  SignageViewState.waiting;
+
+              usbStatus =
+                  'BLEタグを接続してください';
+
+              processStatus =
+                  '待機中';
+
+              errorMessage =
+                  null;
+
+              tagResult =
+                  null;
+
+              checkpointHits =
+                  [];
+
+              interactionHits =
+                  [];
+
+              seedInventory =
+                  [];
+
+              activeFlowersByType =
+                  {};
+
+              resultDisplayStages =
+                  {};
+
+              resultStageDeltas =
+                  {};
+
+              bloomCounts =
+                  {};
+
+              unusedSeedCounts =
+                  {};
+
+              newlyAddedSeeds.clear();
+              alreadyOwnedSeeds.clear();
+
+              alreadyImported =
+                  false;
+
+              currentImportHash =
+                  null;
+
+              deletedLogCount =
+                  0;
+
+              lastStageDelta =
+                  0;
+
+              isLoading =
+                  false;
+            });
+          },
         );
-      }
-    }
+      },
+    );
   }
 
-  Widget _buildMainSignageContent(
-    double availableHeight,
-  ) {
-    final mainImageHeight =
-        (availableHeight * 0.40)
-            .clamp(
-              180.0,
-              390.0,
-            )
-            .toDouble();
+  // ============================================================
+  // IMAGE HELPERS
+  // ============================================================
 
-    switch (signageViewState) {
-      case SignageViewState.waiting:
-        return _statusPanel(
-          image: Image.asset(
-            'assets/images/take.png',
-            height: mainImageHeight * 0.72,
-            fit: BoxFit.contain,
-          ),
-          title:
-              'タグを接続してください',
-          subtitle:
-              'ケーブルにタグを挿すと、自動で読み込みを開始します',
-        );
+  String _flowerStageAsset(String flowerId, int stage) {
+    return 'assets/images/$flowerId/$flowerId$stage.png';
+  }
 
-      case SignageViewState.processing:
-        return _statusPanel(
-          image: Image.asset(
-            'assets/images/no_take.png',
-            height: mainImageHeight * 0.72,
-            fit: BoxFit.contain,
-          ),
-          title:
-              'タグを抜かないでください',
-          subtitle:
-              '活動データを読み込んでいます…',
-          loading:
-              true,
-        );
+  String _seedAsset(String flowerId) {
+    // 既存の種画像名を継続利用。
+    return 'assets/images/$flowerId/${flowerId}_seed.png';
+  }
 
-      case SignageViewState.growth:
-        final flowerId =
-            uiFlowerId ??
-                currentFlowerId;
+  int _displayStageFor(String flowerId) {
+    return resultDisplayStages[flowerId] ??
+        ((activeFlowersByType[flowerId]?['stage'] as num?)?.toInt() ?? 0);
+  }
 
-        final stage =
-            uiFlowerId != null
-                ? uiStage
-                : currentStage;
+  // ============================================================
+  // COMMON BACKGROUND
+  // ============================================================
 
-        return _statusPanel(
-          image: AnimatedSwitcher(
-            duration:
-                const Duration(
-              milliseconds: 650,
-            ),
-            transitionBuilder:
-                (
-              child,
-              animation,
-            ) {
-              return FadeTransition(
-                opacity:
-                    animation,
-                child:
-                    ScaleTransition(
-                  scale:
-                      Tween<double>(
-                    begin:
-                        0.82,
-                    end:
-                        1.0,
-                  ).animate(
-                    CurvedAnimation(
-                      parent:
-                          animation,
-                      curve:
-                          Curves.easeOutBack,
-                    ),
-                  ),
-                  child:
-                      child,
+  Widget _buildWorldBackground() {
+    return LayoutBuilder(
+      builder:
+          (
+        context,
+        constraints,
+      ) {
+        final width =
+            constraints.maxWidth;
+
+        final height =
+            constraints.maxHeight;
+
+        final isPortrait =
+            height > width;
+
+        final sunSize =
+            (width *
+                    (isPortrait
+                        ? 0.16
+                        : 0.085))
+                .clamp(
+                  85.0,
+                  145.0,
+                )
+                .toDouble();
+
+        return Stack(
+          children: [
+            // 空
+            const Positioned.fill(
+              child: ColoredBox(
+                color:
+                    Color(
+                  0xFFB9E3F7,
                 ),
-              );
-            },
-            child: KeyedSubtree(
-              key: ValueKey(
-                '$flowerId-$stage',
-              ),
-              child:
-                  _buildFlowerStage(
-                flowerId:
-                    flowerId,
-                stage:
-                    stage,
-                height:
-                    mainImageHeight,
               ),
             ),
-          ),
-          title:
-              '花が成長しました！',
-          subtitle:
-              'Stage $stage / 3',
-        );
 
-      case SignageViewState.bloom:
-        final flowerId =
-            uiFlowerId ??
-                bloomedFlowerId ??
-                currentFlowerId;
-
-        return _statusPanel(
-          image:
-              TweenAnimationBuilder<double>(
-            tween:
-                Tween<double>(
-              begin:
-                  0.55,
-              end:
-                  1.0,
-            ),
-            duration:
-                const Duration(
-              milliseconds:
-                  900,
-            ),
-            curve:
-                Curves.elasticOut,
-            builder:
-                (
-              context,
-              scale,
-              child,
-            ) {
-              return Transform.scale(
-                scale:
-                    scale,
-                child:
-                    child,
-              );
-            },
-            child:
-                _buildFlowerStage(
-              flowerId:
-                  flowerId,
-              stage:
-                  3,
+            // 地面：常に画面下1/3
+            Positioned(
+              left:
+                  0,
+              right:
+                  0,
+              bottom:
+                  0,
               height:
-                  mainImageHeight * 1.04,
+                  height /
+                      3,
+              child:
+                  const ColoredBox(
+                color:
+                    Color(
+                  0xFFE7D2AD,
+                ),
+              ),
             ),
-          ),
-          title:
-              '花が咲きました！',
-          subtitle:
-              'おめでとうございます',
-          celebration:
-              true,
-        );
 
-      case SignageViewState.complete:
-        return _statusPanel(
-          image: Image.asset(
-            'assets/images/take.png',
-            height: mainImageHeight * 0.72,
-            fit: BoxFit.contain,
-          ),
-          title:
-              'タグを抜いてください',
-          subtitle:
-              '処理は完了しました。安全に取り外せます',
+            // 太陽
+            Positioned(
+              top:
+                  height *
+                      0.025,
+              right:
+                  width *
+                      0.035,
+              child:
+                  Image.asset(
+                'assets/images/sun.png',
+                width:
+                    sunSize,
+                height:
+                    sunSize,
+                fit:
+                    BoxFit.contain,
+              ),
+            ),
+          ],
         );
-    }
+      },
+    );
   }
 
-  Widget _statusPanel({
-    required Widget image,
-    required String title,
-    required String subtitle,
-    bool loading = false,
-    bool celebration = false,
+  // ============================================================
+  // WAITING / PROCESSING
+  // ============================================================
+
+  // Widget _buildEmptyPotsRow() {
+  //   return LayoutBuilder(
+  //     builder:
+  //         (
+  //       context,
+  //       constraints,
+  //     ) {
+  //       return _buildResponsiveEmptyPotsRow(
+  //         availableWidth:
+  //             constraints.maxWidth,
+  //         availableHeight:
+  //             constraints.maxHeight,
+  //       );
+  //     },
+  //   );
+  // }
+
+  Widget _buildSimpleState({
+    required String handImage,
+    required String message,
+    required bool showProgress,
   }) {
-    return Column(
-      mainAxisSize:
-          MainAxisSize.min,
-      children: [
-        image,
+    return LayoutBuilder(
+      builder:
+          (
+        context,
+        constraints,
+      ) {
+        final width =
+            constraints.maxWidth;
 
-        const SizedBox(
-          height:
-              14,
-        ),
+        final height =
+            constraints.maxHeight;
 
-        if (celebration)
-          const Text(
-            '✨  ✨  ✨',
+        final isPortrait =
+            height > width;
+
+        final imageHeight =
+            (height *
+                    (isPortrait
+                        ? 0.16
+                        : 0.17))
+                .clamp(
+                  90.0,
+                  170.0,
+                )
+                .toDouble();
+
+        final messageFontSize =
+            (width *
+                    (isPortrait
+                        ? 0.060
+                        : 0.028))
+                .clamp(
+                  30.0,
+                  48.0,
+                )
+                .toDouble();
+
+        return Stack(
+          children: [
+            Positioned(
+              left:
+                  width *
+                      0.025,
+              right:
+                  width *
+                      0.025,
+              bottom:
+                  height /
+                          3 -
+                      height *
+                          0.018,
+              child:
+                  _buildResponsiveEmptyPotsRow(
+                availableWidth:
+                    width *
+                        0.95,
+                availableHeight:
+                    height,
+              ),
+            ),
+
+            Positioned.fill(
+              child: Center(
+                child:
+                    Transform.translate(
+                  offset:
+                      Offset(
+                    0,
+                    -height *
+                        (isPortrait
+                            ? 0.10
+                            : 0.045),
+                  ),
+                  child: Column(
+                    mainAxisSize:
+                        MainAxisSize.min,
+                    children: [
+                      Image.asset(
+                        handImage,
+                        height:
+                            imageHeight,
+                        fit:
+                            BoxFit.contain,
+                      ),
+
+                      SizedBox(
+                        height:
+                            height *
+                                0.018,
+                      ),
+
+                      Text(
+                        message,
+                        textAlign:
+                            TextAlign.center,
+                        style:
+                            TextStyle(
+                          fontSize:
+                              messageFontSize,
+                          fontWeight:
+                              FontWeight.w900,
+                          color:
+                              const Color(
+                            0xFF163B59,
+                          ),
+                        ),
+                      ),
+
+                      if (showProgress) ...[
+                        SizedBox(
+                          height:
+                              height *
+                                  0.022,
+                        ),
+
+                        SizedBox(
+                          width:
+                              (width *
+                                      0.06)
+                                  .clamp(
+                                    34.0,
+                                    50.0,
+                                  )
+                                  .toDouble(),
+                          height:
+                              (width *
+                                      0.06)
+                                  .clamp(
+                                    34.0,
+                                    50.0,
+                                  )
+                                  .toDouble(),
+                          child:
+                              const CircularProgressIndicator(
+                            strokeWidth:
+                                5,
+                            color:
+                                Color(
+                              0xFF163B59,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // ============================================================
+  // RESULT UI
+  // ============================================================
+
+  Widget _buildFlowerResultCell(
+    String flowerId, {
+    required double width,
+    required double imageHeight,
+    required double bloomFontSize,
+    required double deltaFontSize,
+  }) {
+    final stage =
+        _displayStageFor(
+      flowerId,
+    );
+
+    final maxStage =
+        flowerMaxStages[flowerId]!;
+
+    final safeStage =
+        stage
+            .clamp(
+              0,
+              maxStage,
+            )
+            .toInt();
+
+    final delta =
+        resultStageDeltas[flowerId] ??
+            0;
+
+    final bloomCount =
+        bloomCounts[flowerId] ??
+            0;
+
+    return SizedBox(
+      width:
+          width,
+      child: Column(
+        mainAxisSize:
+            MainAxisSize.min,
+        children: [
+          // ----------------------------------------------------
+          // 累計開花数
+          // ----------------------------------------------------
+          FittedBox(
+            fit:
+                BoxFit.scaleDown,
+            child: Text(
+              '開花 $bloomCount 本',
+              textAlign:
+                  TextAlign.center,
+              style:
+                  TextStyle(
+                fontSize:
+                    bloomFontSize,
+                fontWeight:
+                    FontWeight.w900,
+                color:
+                    const Color(
+                  0xFF163B59,
+                ),
+              ),
+            ),
+          ),
+
+          SizedBox(
+            height:
+                imageHeight *
+                    0.015,
+          ),
+
+          // ----------------------------------------------------
+          // 今回の成長Stage
+          // ----------------------------------------------------
+          Text(
+            '+$delta',
+            textAlign:
+                TextAlign.center,
             style:
                 TextStyle(
               fontSize:
-                  30,
+                  deltaFontSize,
+              fontWeight:
+                  FontWeight.w900,
+              color:
+                  delta > 0
+                      ? const Color(
+                          0xFFC62828,
+                        )
+                      : const Color(
+                          0xFF1565C0,
+                        ),
             ),
           ),
 
-        Text(
-          title,
-          textAlign:
-              TextAlign.center,
-          style:
-              const TextStyle(
-            fontSize:
-                38,
-            fontWeight:
-                FontWeight.w800,
-            color:
-                Color(
-              0xFF27462E,
-            ),
-          ),
-        ),
-
-        const SizedBox(
-          height:
-              8,
-        ),
-
-        Text(
-          subtitle,
-          textAlign:
-              TextAlign.center,
-          style:
-              const TextStyle(
-            fontSize:
-                20,
-            fontWeight:
-                FontWeight.w500,
-            color:
-                Color(
-              0xFF56705C,
-            ),
-          ),
-        ),
-
-        if (loading) ...[
-          const SizedBox(
+          SizedBox(
             height:
-                24,
+                imageHeight *
+                    0.02,
           ),
-          const SizedBox(
+
+          // ----------------------------------------------------
+          // 花画像
+          //
+          // すべてのStageで画像表示領域の高さを固定し、
+          // bottomCenter基準で配置する。
+          // これによりStage変更時も鉢底の位置を固定する。
+          // ----------------------------------------------------
+          SizedBox(
             width:
-                42,
+                width,
             height:
-                42,
-            child:
-                CircularProgressIndicator(
-              strokeWidth:
-                  5,
+                imageHeight,
+            child: Align(
+              alignment:
+                  Alignment.bottomCenter,
+              child: Image.asset(
+                _flowerStageAsset(
+                  flowerId,
+                  safeStage,
+                ),
+                width:
+                    width,
+                height:
+                    imageHeight,
+                fit:
+                    BoxFit.contain,
+                alignment:
+                    Alignment.bottomCenter,
+                errorBuilder:
+                    (
+                  context,
+                  error,
+                  stackTrace,
+                ) {
+                  return Align(
+                    alignment:
+                        Alignment.bottomCenter,
+                    child: Text(
+                      '$flowerId\n'
+                      'Stage $safeStage',
+                      textAlign:
+                          TextAlign.center,
+                      style:
+                          TextStyle(
+                        fontSize:
+                            bloomFontSize *
+                                0.8,
+                        fontWeight:
+                            FontWeight.w700,
+                        color:
+                            const Color(
+                          0xFF163B59,
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildFlowerGarden() {
+    return LayoutBuilder(
+      builder:
+          (
+        context,
+        constraints,
+      ) {
+        final width =
+            constraints.maxWidth;
+
+        final height =
+            constraints.maxHeight;
+
+        final isPortrait =
+            height > width;
+
+        // ======================================================
+        // 横型 / 縦型で比率だけ切り替える。
+        //
+        // 固定pxではなく、利用可能領域の幅・高さから算出する。
+        // ======================================================
+
+        final horizontalPadding =
+            width *
+                (isPortrait
+                    ? 0.035
+                    : 0.025);
+
+        final usableWidth =
+            width -
+                horizontalPadding *
+                    2;
+
+        final frontCellWidth =
+            usableWidth /
+                (isPortrait
+                    ? 4.25
+                    : 4.15);
+
+        final backCellWidth =
+            frontCellWidth *
+                (isPortrait
+                    ? 0.90
+                    : 0.86);
+
+        final frontImageHeight =
+            height *
+                (isPortrait
+                    ? 0.31
+                    : 0.38);
+
+        final backImageHeight =
+            height *
+                (isPortrait
+                    ? 0.27
+                    : 0.33);
+
+        final bloomFontSize =
+            (width *
+                    (isPortrait
+                        ? 0.032
+                        : 0.015))
+                .clamp(
+                  14.0,
+                  22.0,
+                )
+                .toDouble();
+
+        final deltaFontSize =
+            (width *
+                    (isPortrait
+                        ? 0.041
+                        : 0.020))
+                .clamp(
+                  20.0,
+                  32.0,
+                )
+                .toDouble();
+
+        final backTop =
+            height *
+                (isPortrait
+                    ? 0.02
+                    : 0.00);
+
+        final frontBottom =
+            height *
+                (isPortrait
+                    ? 0.015
+                    : 0.00);
+
+        // ======================================================
+        // 千鳥配置
+        //
+        // 後列: tulip / rose / suzuran
+        // 前列: sunflower / kernation / ajisai / cosmos
+        //
+        //     ●      ●      ●
+        //   ●    ●      ●      ●
+        // ======================================================
+
+        return Stack(
+          clipBehavior:
+              Clip.none,
+          children: [
+            Positioned(
+              left:
+                  horizontalPadding +
+                      usableWidth *
+                          (isPortrait
+                              ? 0.095
+                              : 0.105),
+              right:
+                  horizontalPadding +
+                      usableWidth *
+                          (isPortrait
+                              ? 0.095
+                              : 0.105),
+              top:
+                  backTop,
+              child: Row(
+                mainAxisAlignment:
+                    MainAxisAlignment
+                        .spaceBetween,
+                crossAxisAlignment:
+                    CrossAxisAlignment
+                        .end,
+                children: [
+                  _buildFlowerResultCell(
+                    flowerIds[0],
+                    width:
+                        backCellWidth,
+                    imageHeight:
+                        backImageHeight,
+                    bloomFontSize:
+                        bloomFontSize,
+                    deltaFontSize:
+                        deltaFontSize,
+                  ),
+                  _buildFlowerResultCell(
+                    flowerIds[2],
+                    width:
+                        backCellWidth,
+                    imageHeight:
+                        backImageHeight,
+                    bloomFontSize:
+                        bloomFontSize,
+                    deltaFontSize:
+                        deltaFontSize,
+                  ),
+                  _buildFlowerResultCell(
+                    flowerIds[4],
+                    width:
+                        backCellWidth,
+                    imageHeight:
+                        backImageHeight,
+                    bloomFontSize:
+                        bloomFontSize,
+                    deltaFontSize:
+                        deltaFontSize,
+                  ),
+                ],
+              ),
+            ),
+
+            Positioned(
+              left:
+                  horizontalPadding,
+              right:
+                  horizontalPadding,
+              bottom:
+                  frontBottom,
+              child: Row(
+                mainAxisAlignment:
+                    MainAxisAlignment
+                        .spaceBetween,
+                crossAxisAlignment:
+                    CrossAxisAlignment
+                        .end,
+                children: [
+                  _buildFlowerResultCell(
+                    flowerIds[1],
+                    width:
+                        frontCellWidth,
+                    imageHeight:
+                        frontImageHeight,
+                    bloomFontSize:
+                        bloomFontSize,
+                    deltaFontSize:
+                        deltaFontSize,
+                  ),
+                  _buildFlowerResultCell(
+                    flowerIds[3],
+                    width:
+                        frontCellWidth,
+                    imageHeight:
+                        frontImageHeight,
+                    bloomFontSize:
+                        bloomFontSize,
+                    deltaFontSize:
+                        deltaFontSize,
+                  ),
+                  _buildFlowerResultCell(
+                    flowerIds[5],
+                    width:
+                        frontCellWidth,
+                    imageHeight:
+                        frontImageHeight,
+                    bloomFontSize:
+                        bloomFontSize,
+                    deltaFontSize:
+                        deltaFontSize,
+                  ),
+                  _buildFlowerResultCell(
+                    flowerIds[6],
+                    width:
+                        frontCellWidth,
+                    imageHeight:
+                        frontImageHeight,
+                    bloomFontSize:
+                        bloomFontSize,
+                    deltaFontSize:
+                        deltaFontSize,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildSeedResultCell(
+    String flowerId, {
+    required double imageSize,
+    required double fontSize,
+  }) {
+    final count =
+        unusedSeedCounts[flowerId] ??
+            0;
+
+    return Expanded(
+      child: Column(
+        mainAxisSize:
+            MainAxisSize.min,
+        children: [
+          Image.asset(
+            _seedAsset(
+              flowerId,
+            ),
+            width:
+                imageSize,
+            height:
+                imageSize,
+            fit:
+                BoxFit.contain,
+            errorBuilder:
+                (
+              context,
+              error,
+              stackTrace,
+            ) {
+              return SizedBox(
+                width:
+                    imageSize,
+                height:
+                    imageSize,
+              );
+            },
+          ),
+
+          SizedBox(
+            height:
+                imageSize *
+                    0.08,
+          ),
+
+          Text(
+            '×$count',
+            style:
+                TextStyle(
+              fontSize:
+                  fontSize,
+              fontWeight:
+                  FontWeight.w900,
+              color:
+                  const Color(
+                0xFF5D4633,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildResultScreen() {
+    return LayoutBuilder(
+      builder:
+          (
+        context,
+        constraints,
+      ) {
+        final width =
+            constraints.maxWidth;
+
+        final height =
+            constraints.maxHeight;
+
+        final isPortrait =
+            height > width;
+
+        final horizontalPadding =
+            width *
+                (isPortrait
+                    ? 0.035
+                    : 0.022);
+
+        final topPadding =
+            height *
+                (isPortrait
+                    ? 0.045
+                    : 0.035);
+
+        final bottomPadding =
+            height *
+                0.015;
+
+        final seedImageSize =
+            (width *
+                    (isPortrait
+                        ? 0.080
+                        : 0.038))
+                .clamp(
+                  32.0,
+                  62.0,
+                )
+                .toDouble();
+
+        final seedFontSize =
+            (width *
+                    (isPortrait
+                        ? 0.035
+                        : 0.016))
+                .clamp(
+                  16.0,
+                  24.0,
+                )
+                .toDouble();
+
+        final seedTitleFontSize =
+            (width *
+                    (isPortrait
+                        ? 0.036
+                        : 0.017))
+                .clamp(
+                  18.0,
+                  25.0,
+                )
+                .toDouble();
+
+        // 縦型では花壇を大きく取り、
+        // 種エリアは下部へまとめる。
+        final gardenFlex =
+            isPortrait
+                ? 8
+                : 7;
+
+        final seedFlex =
+            isPortrait
+                ? 2
+                : 2;
+
+        return Padding(
+          padding:
+              EdgeInsets.fromLTRB(
+            horizontalPadding,
+            topPadding,
+            horizontalPadding,
+            bottomPadding,
+          ),
+          child: Column(
+            children: [
+              Expanded(
+                flex:
+                    gardenFlex,
+                child:
+                    _buildFlowerGarden(),
+              ),
+
+              SizedBox(
+                height:
+                    height *
+                        0.010,
+              ),
+
+              Expanded(
+                flex:
+                    seedFlex,
+                child: Column(
+                  mainAxisAlignment:
+                      MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      '持っている種（未使用）',
+                      style:
+                          TextStyle(
+                        fontSize:
+                            seedTitleFontSize,
+                        fontWeight:
+                            FontWeight.w900,
+                        color:
+                            const Color(
+                          0xFF5D4633,
+                        ),
+                      ),
+                    ),
+
+                    SizedBox(
+                      height:
+                          height *
+                              0.008,
+                    ),
+
+                    Row(
+                      children: [
+                        for (final flowerId
+                            in flowerIds)
+                          _buildSeedResultCell(
+                            flowerId,
+                            imageSize:
+                                seedImageSize,
+                            fontSize:
+                                seedFontSize,
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // ============================================================
+  // TAKE / WAITING MESSAGE
+  // ============================================================
+
+  Widget _buildTakeState({
+    required String message,
+  }) {
+    return LayoutBuilder(
+      builder:
+          (
+        context,
+        constraints,
+      ) {
+        final width =
+            constraints.maxWidth;
+
+        final height =
+            constraints.maxHeight;
+
+        final isPortrait =
+            height > width;
+
+        final handHeight =
+            (height *
+                    (isPortrait
+                        ? 0.16
+                        : 0.17))
+                .clamp(
+                  90.0,
+                  170.0,
+                )
+                .toDouble();
+
+        final messageFontSize =
+            (width *
+                    (isPortrait
+                        ? 0.060
+                        : 0.028))
+                .clamp(
+                  30.0,
+                  48.0,
+                )
+                .toDouble();
+
+        return Stack(
+          children: [
+            // --------------------------------------------------
+            // 7個のStage0鉢
+            // 地面上端を基準に配置するため、
+            // 縦横比が変わっても鉢位置が大きく崩れない。
+            // --------------------------------------------------
+            Positioned(
+              left:
+                  width *
+                      0.025,
+              right:
+                  width *
+                      0.025,
+              bottom:
+                  height /
+                          3 -
+                      height *
+                          0.018,
+              child:
+                  _buildResponsiveEmptyPotsRow(
+                availableWidth:
+                    width *
+                        0.95,
+                availableHeight:
+                    height,
+              ),
+            ),
+
+            // --------------------------------------------------
+            // TAKE / message
+            // --------------------------------------------------
+            Positioned.fill(
+              child: Center(
+                child:
+                    Transform.translate(
+                  offset:
+                      Offset(
+                    0,
+                    -height *
+                        (isPortrait
+                            ? 0.10
+                            : 0.045),
+                  ),
+                  child: Column(
+                    mainAxisSize:
+                        MainAxisSize.min,
+                    children: [
+                      Image.asset(
+                        'assets/images/take.png',
+                        height:
+                            handHeight,
+                        fit:
+                            BoxFit.contain,
+                      ),
+
+                      SizedBox(
+                        height:
+                            height *
+                                0.018,
+                      ),
+
+                      Text(
+                        message,
+                        textAlign:
+                            TextAlign.center,
+                        style:
+                            TextStyle(
+                          fontSize:
+                              messageFontSize,
+                          fontWeight:
+                              FontWeight.w900,
+                          color:
+                              const Color(
+                            0xFF163B59,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildResponsiveEmptyPotsRow({
+    required double availableWidth,
+    required double availableHeight,
+  }) {
+    final isPortrait =
+        availableHeight >
+            availableWidth;
+
+    final potHeight =
+        (availableHeight *
+                (isPortrait
+                    ? 0.095
+                    : 0.15))
+            .clamp(
+              65.0,
+              150.0,
+            )
+            .toDouble();
+
+    return Row(
+      crossAxisAlignment:
+          CrossAxisAlignment.end,
+      children: [
+        for (final flowerId
+            in flowerIds)
+          Expanded(
+            child: SizedBox(
+              height:
+                  potHeight,
+              child: Align(
+                alignment:
+                    Alignment.bottomCenter,
+                child: Image.asset(
+                  _flowerStageAsset(
+                    flowerId,
+                    0,
+                  ),
+                  height:
+                      potHeight,
+                  fit:
+                      BoxFit.contain,
+                  alignment:
+                      Alignment.bottomCenter,
+                  errorBuilder:
+                      (
+                    context,
+                    error,
+                    stackTrace,
+                  ) {
+                    return SizedBox(
+                      height:
+                          potHeight,
+                    );
+                  },
+                ),
+              ),
+            ),
+          ),
       ],
     );
+  }
+
+  // ============================================================
+  // MAIN SIGNAGE CONTENT
+  // ============================================================
+
+  Widget _buildMainSignageContent() {
+    switch (signageViewState) {
+      case SignageViewState.waiting:
+        return _buildTakeState(
+          message:
+              '接続してください',
+        );
+
+      case SignageViewState.processing:
+        return Center(
+          child: _buildSimpleState(
+            handImage:
+                'assets/images/no_take.png',
+            message:
+                '抜かないでください',
+            showProgress:
+                true,
+          ),
+        );
+
+      case SignageViewState.growth:
+      case SignageViewState.bloom:
+        return _buildResultScreen();
+
+      case SignageViewState.complete:
+        return _buildTakeState(
+          message:
+              '抜いても大丈夫です',
+        );
+    }
   }
 
   // ============================================================
@@ -2402,232 +3333,46 @@ class _TagFolderScreenState
   // ============================================================
 
   @override
-  Widget build(
-    BuildContext context,
-  ) {
-    if (config == null &&
-        errorMessage == null) {
+  Widget build(BuildContext context) {
+    if (config == null && errorMessage == null) {
       return const Scaffold(
-        backgroundColor:
-            Color(
-          0xFFF4F7E8,
-        ),
-        body:
-            Center(
-          child:
-              CircularProgressIndicator(),
-        ),
+        backgroundColor: Color(0xFFB9E3F7),
+        body: Center(child: CircularProgressIndicator()),
       );
     }
 
     return Scaffold(
-      backgroundColor:
-          const Color(
-        0xFFF4F7E8,
-      ),
+      backgroundColor: const Color(0xFFB9E3F7),
       body: SafeArea(
-        child: LayoutBuilder(
-          builder:
-              (
-            context,
-            constraints,
-          ) {
-            final sunSize =
-                (constraints.maxWidth *
-                        0.10)
-                    .clamp(
-                      82.0,
-                      150.0,
-                    )
-                    .toDouble();
-
-            final flowerBedHeight =
-                (constraints.maxHeight *
-                        0.25)
-                    .clamp(
-                      150.0,
-                      270.0,
-                    )
-                    .toDouble();
-
-            return Stack(
-              children: [
-                // ------------------------------------------------
-                // SUN
-                // ------------------------------------------------
-
-                Positioned(
-                  top:
-                      24,
-                  right:
-                      34,
-                  child:
-                      Image.asset(
-                    'assets/images/sun.png',
-                    width:
-                        sunSize,
-                    height:
-                        sunSize,
-                    fit:
-                        BoxFit.contain,
+        child: Stack(
+          children: [
+            _buildWorldBackground(),
+            Positioned.fill(
+              child: _buildMainSignageContent(),
+            ),
+            if (errorMessage != null)
+              Positioned(
+                left: 30,
+                right: 30,
+                bottom: 30,
+                child: Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.94),
+                    borderRadius: BorderRadius.circular(18),
                   ),
-                ),
-
-                // ------------------------------------------------
-                // MAIN CONTENT
-                // ------------------------------------------------
-
-                Positioned.fill(
-                  bottom:
-                      flowerBedHeight * 0.72,
-                  child:
-                      Center(
-                    child:
-                        Padding(
-                      padding:
-                          const EdgeInsets.symmetric(
-                        horizontal:
-                            40,
-                        vertical:
-                            24,
-                      ),
-                      child:
-                          AnimatedSwitcher(
-                        duration:
-                            const Duration(
-                          milliseconds:
-                              450,
-                        ),
-                        child:
-                            KeyedSubtree(
-                          key:
-                              ValueKey(
-                            signageViewState,
-                          ),
-                          child:
-                              _buildMainSignageContent(
-                            constraints.maxHeight,
-                          ),
-                        ),
-                      ),
+                  child: Text(
+                    errorMessage!,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 18,
+                      color: Colors.redAccent,
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
                 ),
-
-                // ------------------------------------------------
-                // FLOWER BED
-                // ------------------------------------------------
-
-                Positioned(
-                  left:
-                      0,
-                  right:
-                      0,
-                  bottom:
-                      0,
-                  height:
-                      flowerBedHeight,
-                  child:
-                      IgnorePointer(
-                    child:
-                        Image.asset(
-                      'assets/images/flower.png',
-                      fit:
-                          BoxFit.fitWidth,
-                      alignment:
-                          Alignment.bottomCenter,
-                    ),
-                  ),
-                ),
-
-                // ------------------------------------------------
-                // MANUAL DEBUG BUTTON
-                // ------------------------------------------------
-
-                Positioned(
-                  top:
-                      18,
-                  left:
-                      18,
-                  child:
-                      Opacity(
-                    opacity:
-                        0.35,
-                    child:
-                        IconButton(
-                      tooltip:
-                          'タグフォルダを手動選択',
-                      onPressed:
-                          isLoading
-                              ? null
-                              : selectTagFolder,
-                      icon:
-                          const Icon(
-                        Icons.folder_open,
-                      ),
-                    ),
-                  ),
-                ),
-
-                // ------------------------------------------------
-                // ERROR
-                // ------------------------------------------------
-
-                if (errorMessage !=
-                    null)
-                  Positioned(
-                    left:
-                        30,
-                    right:
-                        30,
-                    bottom:
-                        flowerBedHeight + 12,
-                    child:
-                        Container(
-                      padding:
-                          const EdgeInsets.all(
-                        16,
-                      ),
-                      decoration:
-                          BoxDecoration(
-                        color:
-                            const Color(
-                          0xFFFFF1F0,
-                        ),
-                        borderRadius:
-                            BorderRadius.circular(
-                          18,
-                        ),
-                        border:
-                            Border.all(
-                          color:
-                              const Color(
-                            0xFFC95A50,
-                          ),
-                        ),
-                      ),
-                      child:
-                          Text(
-                        errorMessage!,
-                        textAlign:
-                            TextAlign.center,
-                        style:
-                            const TextStyle(
-                          fontSize:
-                              16,
-                          fontWeight:
-                              FontWeight.w600,
-                          color:
-                              Color(
-                            0xFF7D2922,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-              ],
-            );
-          },
+              ),
+          ],
         ),
       ),
     );
@@ -2639,14 +3384,17 @@ class _TagFolderScreenState
 // ================================================================
 
 class FlowerProcessResult {
-  final Map<String, Object?>?
-      activeFlower;
-
-  final String?
-      bloomedFlowerId;
+  final Map<String, Map<String, Object?>> activeFlowers;
+  final Map<String, int> displayStages;
+  final Map<String, int> stageDeltas;
+  final Map<String, int> bloomCounts;
+  final Map<String, int> unusedSeedCounts;
 
   const FlowerProcessResult({
-    required this.activeFlower,
-    required this.bloomedFlowerId,
+    required this.activeFlowers,
+    required this.displayStages,
+    required this.stageDeltas,
+    required this.bloomCounts,
+    required this.unusedSeedCounts,
   });
 }

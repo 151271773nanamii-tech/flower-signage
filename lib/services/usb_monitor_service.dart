@@ -61,6 +61,25 @@ class UsbMonitorService {
       _currentTagMac;
 
   // ============================================================
+  // SAFE EJECT
+  // ============================================================
+
+  /// SafeEjectService.eject() が成功したあとに呼ぶ。
+  ///
+  /// 物理抜線は追跡しない。
+  /// 現在のタグ状態を忘れて、次に検出されたタグを新しい処理対象にする。
+  void completeSafeEject() {
+    debugPrint(
+      'UsbMonitorService: completeSafeEject',
+    );
+
+    _currentTagPath = null;
+    _currentTagMac = null;
+    _mountMissCount = 0;
+    _switchingToStorage = false;
+  }
+
+  // ============================================================
   // START
   // ============================================================
 
@@ -103,6 +122,7 @@ class UsbMonitorService {
     _switchingToStorage = false;
 
     _mountMissCount = 0;
+
   }
 
   // ============================================================

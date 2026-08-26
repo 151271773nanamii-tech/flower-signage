@@ -64,6 +64,13 @@ flutter:
     - assets/config/checkpoints.json
     - assets/config/users.json
     - assets/images/
+    - assets/images/tulip/
+    - assets/images/ajisai/
+    - assets/images/sunflower/
+    - assets/images/rose/
+    - assets/images/cosmos/
+    - assets/images/suzuran/
+    - assets/images/kernation/
   # The following line ensures that the Material Icons font is
   # included with your application, so that you can use the icons in
   # the material Icons class.

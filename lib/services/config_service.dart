@@ -4,6 +4,30 @@ import 'package:flutter/services.dart';
 
 class AppConfig {
   // ============================================================
+  // Supported flowers
+  // ============================================================
+
+  static const List<String> supportedFlowerIds = [
+    'tulip',
+    'sunflower',
+    'rose',
+    'kernation',
+    'suzuran',
+    'ajisai',
+    'cosmos',
+  ];
+
+  static const Map<String, int> flowerMaxStages = {
+    'tulip': 6,
+    'sunflower': 6,
+    'rose': 6,
+    'kernation': 6,
+    'suzuran': 6,
+    'ajisai': 5,
+    'cosmos': 4,
+  };
+
+  // ============================================================
   // Growth
   // ============================================================
 
@@ -167,6 +191,96 @@ class AppConfig {
   }
 
   // ============================================================
+  // Flower helpers
+  // ============================================================
+
+  bool isSupportedFlower(
+    String flowerId,
+  ) {
+    return supportedFlowerIds.contains(
+      flowerId,
+    );
+  }
+
+  int maxStageForFlower(
+    String flowerId,
+  ) {
+    final maxStage =
+        flowerMaxStages[flowerId];
+
+    if (maxStage == null) {
+      throw ArgumentError(
+        '未対応のflower_idです。\n'
+        'flower_id: $flowerId\n'
+        '使用可能: ${supportedFlowerIds.join(', ')}',
+      );
+    }
+
+    return maxStage;
+  }
+
+  int clampStageForFlower({
+    required String flowerId,
+    required int stage,
+  }) {
+    final maxStage =
+        maxStageForFlower(
+      flowerId,
+    );
+
+    return stage
+        .clamp(
+          0,
+          maxStage,
+        )
+        .toInt();
+  }
+
+  bool isBloomStage({
+    required String flowerId,
+    required int stage,
+  }) {
+    return stage >=
+        maxStageForFlower(
+          flowerId,
+        );
+  }
+
+  String flowerStageAsset({
+    required String flowerId,
+    required int stage,
+  }) {
+    final safeStage =
+        clampStageForFlower(
+      flowerId:
+          flowerId,
+      stage:
+          stage,
+    );
+
+    return 'assets/images/'
+        '$flowerId/'
+        '$flowerId$safeStage.png';
+  }
+
+  String flowerSeedAsset(
+    String flowerId,
+  ) {
+    if (!isSupportedFlower(
+      flowerId,
+    )) {
+      throw ArgumentError(
+        '未対応のflower_idです。\n'
+        'flower_id: $flowerId',
+      );
+    }
+
+    return 'assets/images/'
+        '$flowerId/'
+        '${flowerId}_seed.png';
+  }
+
+  // ============================================================
   // Validation
   // ============================================================
 
@@ -210,23 +324,19 @@ class AppConfig {
       );
     }
 
-    if (initialSeeds.length != 2) {
-      throw FormatException(
-        'initial_seeds は'
-        '2個指定してください。\n'
-        '現在: ${initialSeeds.length}個',
-      );
-    }
-
-    if (initialSeeds
-            .toSet()
-            .length !=
-        initialSeeds.length) {
-      throw const FormatException(
-        'initial_seeds に'
-        '同じ花を重複して'
-        '指定できません。',
-      );
+    // 新仕様では初期種の個数を2個に固定しない。
+    // 同じ種類の種を複数持つことも可能。
+    for (final flowerId
+        in initialSeeds) {
+      if (!supportedFlowerIds.contains(
+        flowerId,
+      )) {
+        throw FormatException(
+          'initial_seeds に'
+          '未対応のflower_idがあります。\n'
+          'flower_id: $flowerId',
+        );
+      }
     }
 
     if (scanGroupSeconds <= 0) {
@@ -261,6 +371,8 @@ AppConfig(
   stage2Threshold: $stage2Threshold,
   stage3Threshold: $stage3Threshold,
   initialSeeds: $initialSeeds,
+  supportedFlowerIds: $supportedFlowerIds,
+  flowerMaxStages: $flowerMaxStages,
   scanGroupSeconds: $scanGroupSeconds,
   usbPollSeconds: $usbPollSeconds,
   disconnectMissThreshold: $disconnectMissThreshold,
@@ -412,13 +524,13 @@ class ConfigService {
     } on FormatException catch (e) {
       throw Exception(
         'app_config.json の'
-        '設定内容が不正です。\n\n'
+        '設定内容が不正です.\n\n'
         '${e.message}',
       );
     } catch (e) {
       throw Exception(
         'app_config.json の'
-        '読み込みに失敗しました。\n\n'
+        '読み込みに失敗しました.\n\n'
         '$e',
       );
     }

@@ -5,26 +5,18 @@
     "stage2_threshold": 600,
     "stage3_threshold": 1000
   },
-
-  "initial_seeds": [
-    "sunflower",
-    "tulip"
-  ],
-
+  "initial_seeds": [],
   "scan": {
     "group_seconds": 15
   },
-
   "usb": {
     "poll_seconds": 1,
     "disconnect_miss_threshold": 3
   },
-
   "log": {
     "delete_after_success": false,
-    "delete_processed_logs": true
+    "delete_processed_logs": false
   },
-
   "debug": {
     "logging": true
   }
