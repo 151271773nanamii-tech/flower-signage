@@ -1,36 +1,34 @@
 [
   {
     "id": "checkpoint_001",
-    "name": "テスト図書館",
+    "name": "ゲストハウス",
     "addresses": [
-      "F4:4E:FD:A1:00:01",
-      "F4:4E:FD:A1:00:02",
-      "F4:4E:FD:A1:00:03",
-      "F4:4E:FD:A1:00:04"
+      "B0:E9:FE:57:E1:C0",
+      "B0:E9:FE:CE:31:6A",
+      "F4:4E:FD:B5:25:2E",
+      "F4:4E:FD:D1:98:8F"
     ],
-    "required_ratio": 0.5,
+    "required_ratio": 0.25,
     "flower": "kernation"
   },
   {
     "id": "checkpoint_002",
-    "name": "テスト公民館",
+    "name": "バイオ",
     "addresses": [
-      "F4:4E:FD:A2:00:01",
-      "F4:4E:FD:A2:00:02",
-      "F4:4E:FD:A2:00:03",
-      "F4:4E:FD:A2:00:04"
+      "F4:4E:FD:B5:25:2E",
+      "24:B2:31:9C:25:3D",
+      "88:92:CC:28:87:D7",
+      "74:19:0A:1F:19:72"
     ],
-    "required_ratio": 0.5,
+    "required_ratio": 0.25,
     "flower": "suzuran"
   },
   {
     "id": "checkpoint_003",
-    "name": "テスト広場",
+    "name": "エントランス",
     "addresses": [
-      "F4:4E:FD:A3:00:01",
-      "F4:4E:FD:A3:00:02",
-      "F4:4E:FD:A3:00:03",
-      "F4:4E:FD:A3:00:04"
+      "B0:E9:FE:CE:31:6A",
+      "F4:4E:FD:D1:98:8F"
     ],
     "required_ratio": 0.5,
     "flower": "ajisai"

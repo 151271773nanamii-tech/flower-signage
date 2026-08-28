@@ -20,17 +20,11 @@ class TagFolderResult {
   });
 
   int get totalRecordCount {
-    return logResults.fold(
-      0,
-      (sum, result) => sum + result.records.length,
-    );
+    return logResults.fold(0, (sum, result) => sum + result.records.length);
   }
 
   int get totalInvalidLineCount {
-    return logResults.fold(
-      0,
-      (sum, result) => sum + result.invalidLineCount,
-    );
+    return logResults.fold(0, (sum, result) => sum + result.invalidLineCount);
   }
 
   Set<String> get uniqueAddresses {
@@ -47,9 +41,7 @@ class TagFolderResult {
     final result = <String>{};
 
     for (final logResult in logResults) {
-      result.addAll(
-        logResult.uniquePublicAddresses,
-      );
+      result.addAll(logResult.uniquePublicAddresses);
     }
 
     return result;
@@ -59,55 +51,36 @@ class TagFolderResult {
     final result = <String>{};
 
     for (final logResult in logResults) {
-      result.addAll(
-        logResult.uniqueRandomAddresses,
-      );
+      result.addAll(logResult.uniqueRandomAddresses);
     }
 
     return result;
   }
-
-
-
 }
 
 class TagFolderService {
   // ============================================================
   // TAG FOLDER LOAD
   // ============================================================
-  static Future<String> calculateLogHash(
-    File file,
-  ) async {
+  static Future<String> calculateLogHash(File file) async {
     final bytes = await file.readAsBytes();
     return sha256.convert(bytes).toString();
   }
 
-  static Future<TagFolderResult> loadFolder(
-    String folderPath,
-  ) async {
-    final directory =
-        Directory(
-      folderPath,
-    );
+  static Future<TagFolderResult> loadFolder(String folderPath) async {
+    final directory = Directory(folderPath);
 
     if (!await directory.exists()) {
-      throw Exception(
-        '選択したフォルダが見つかりません。',
-      );
+      throw Exception('選択したフォルダが見つかりません。');
     }
 
-    final entities =
-        await directory
-            .list(
-              recursive: false,
-              followLinks: false,
-            )
-            .toList();
+    final entities = await directory
+        .list(recursive: false, followLinks: false)
+        .toList();
 
     File? userInfoFile;
 
-    final logFiles =
-        <File>[];
+    final logFiles = <File>[];
 
     // ==========================================================
     // user_info.txt / LOG*.TXT を探す
@@ -118,20 +91,16 @@ class TagFolderService {
         continue;
       }
 
-      final fileName =
-          entity.uri.pathSegments.last;
+      final fileName = entity.uri.pathSegments.last;
 
-      final lowerName =
-          fileName.toLowerCase();
+      final lowerName = fileName.toLowerCase();
 
       // --------------------------------------------------------
       // user_info.txt
       // --------------------------------------------------------
 
-      if (lowerName ==
-          'user_info.txt') {
-        userInfoFile =
-            entity;
+      if (lowerName == 'user_info.txt') {
+        userInfoFile = entity;
 
         continue;
       }
@@ -140,15 +109,8 @@ class TagFolderService {
       // LOG*.TXT
       // --------------------------------------------------------
 
-      if (lowerName.startsWith(
-            'log',
-          ) &&
-          lowerName.endsWith(
-            '.txt',
-          )) {
-        logFiles.add(
-          entity,
-        );
+      if (lowerName.startsWith('log') && lowerName.endsWith('.txt')) {
+        logFiles.add(entity);
       }
     }
 
@@ -157,9 +119,7 @@ class TagFolderService {
     // ==========================================================
 
     if (userInfoFile == null) {
-      throw Exception(
-        'user_info.txt が見つかりません。',
-      );
+      throw Exception('user_info.txt が見つかりません。');
     }
 
     // ==========================================================
@@ -176,49 +136,43 @@ class TagFolderService {
     // ファイル名順
     // ==========================================================
 
-    logFiles.sort(
-      (a, b) =>
-          a.path.compareTo(
-        b.path,
-      ),
-    );
+    logFiles.sort((a, b) => a.path.compareTo(b.path));
 
     // ==========================================================
     // UserInfo
     // ==========================================================
 
-    final userInfo =
-        await UserInfoParser
-            .parseFile(
-      userInfoFile.path,
-    );
+    final userInfo = await UserInfoParser.parseFile(userInfoFile.path);
 
     // ==========================================================
     // LOG parse
     // ==========================================================
 
-    final logResults =
-        <LogParseResult>[];
+    final logResults = <LogParseResult>[];
 
     for (final logFile in logFiles) {
-      final result =
-          await LogParser
-              .parseFile(
-        logFile.path,
+      final result = await LogParser.parseFile(logFile.path);
+
+      logResults.add(result);
+    }
+
+    // LOGファイルが存在するのに全体で有効レコードが0件なら、
+    // 壊れたデータを正常データとして成長処理しない。
+    if (logFiles.isNotEmpty) {
+      final totalValidRecords = logResults.fold<int>(
+        0,
+        (sum, item) => sum + item.records.length,
       );
 
-      logResults.add(
-        result,
-      );
+      if (totalValidRecords == 0) {
+        throw Exception('LOGファイルは存在しますが、有効なBLEレコードがありません。');
+      }
     }
 
     return TagFolderResult(
-      userInfo:
-          userInfo,
-      logFiles:
-          logFiles,
-      logResults:
-          logResults,
+      userInfo: userInfo,
+      logFiles: logFiles,
+      logResults: logResults,
     );
   }
 
@@ -237,58 +191,38 @@ class TagFolderService {
   //   その他すべて
   // ============================================================
 
-  static Future<int> deleteLogFiles(
-    List<File> logFiles,
-  ) async {
-    debugPrint(
-      '[DELETE] START',
-    );
+  static Future<int> deleteLogFiles(List<File> logFiles) async {
+    debugPrint('[DELETE] START');
 
     // ==========================================================
     // LOGがない
     // ==========================================================
 
     if (logFiles.isEmpty) {
-      debugPrint(
-        '[DELETE] No LOG files',
-      );
+      debugPrint('[DELETE] No LOG files');
 
       return 0;
     }
 
-    final safeFiles =
-        <File>[];
+    final safeFiles = <File>[];
 
     // ==========================================================
     // 1. 削除対象の安全確認
     // ==========================================================
 
     for (final file in logFiles) {
-      final normalizedPath =
-          file.path.replaceAll(
-        '\\',
-        '/',
-      );
+      final normalizedPath = file.path.replaceAll('\\', '/');
 
-      final fileName =
-          normalizedPath
-              .split('/')
-              .last;
+      final fileName = normalizedPath.split('/').last;
 
-      final upperName =
-          fileName.toUpperCase();
+      final upperName = fileName.toUpperCase();
 
       // --------------------------------------------------------
       // LOG*.TXT 以外は絶対削除しない
       // --------------------------------------------------------
 
       final isLogFile =
-          upperName.startsWith(
-            'LOG',
-          ) &&
-          upperName.endsWith(
-            '.TXT',
-          );
+          upperName.startsWith('LOG') && upperName.endsWith('.TXT');
 
       if (!isLogFile) {
         debugPrint(
@@ -303,10 +237,7 @@ class TagFolderService {
       // 念のため重要ファイルを明示的に保護
       // --------------------------------------------------------
 
-      if (upperName ==
-              'CONFIG.TXT' ||
-          upperName ==
-              'USER_INFO.TXT') {
+      if (upperName == 'CONFIG.TXT' || upperName == 'USER_INFO.TXT') {
         debugPrint(
           '[DELETE] PROTECTED: '
           '$fileName',
@@ -321,9 +252,7 @@ class TagFolderService {
 
       try {
         if (await file.exists()) {
-          safeFiles.add(
-            file,
-          );
+          safeFiles.add(file);
         }
       } catch (e) {
         throw Exception(
@@ -344,9 +273,7 @@ class TagFolderService {
     // ==========================================================
 
     if (safeFiles.isEmpty) {
-      debugPrint(
-        '[DELETE] Nothing to delete',
-      );
+      debugPrint('[DELETE] Nothing to delete');
 
       return 0;
     }
@@ -388,24 +315,19 @@ class TagFolderService {
 
     int remainingCount = 0;
 
-    final remainingPaths =
-        <String>[];
+    final remainingPaths = <String>[];
 
     for (final file in safeFiles) {
       try {
         if (await file.exists()) {
           remainingCount++;
 
-          remainingPaths.add(
-            file.path,
-          );
+          remainingPaths.add(file.path);
         }
       } catch (_) {
         remainingCount++;
 
-        remainingPaths.add(
-          file.path,
-        );
+        remainingPaths.add(file.path);
       }
     }
 
@@ -414,14 +336,10 @@ class TagFolderService {
     // ==========================================================
 
     if (remainingCount > 0) {
-      debugPrint(
-        '[DELETE] Remaining files:',
-      );
+      debugPrint('[DELETE] Remaining files:');
 
       for (final path in remainingPaths) {
-        debugPrint(
-          '[DELETE] REMAIN: $path',
-        );
+        debugPrint('[DELETE] REMAIN: $path');
       }
 
       throw Exception(
@@ -435,9 +353,7 @@ class TagFolderService {
     // SUCCESS
     // ==========================================================
 
-    debugPrint(
-      '[DELETE] SUCCESS',
-    );
+    debugPrint('[DELETE] SUCCESS');
 
     debugPrint(
       '[DELETE] Deleted = '

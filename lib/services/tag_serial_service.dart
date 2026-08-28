@@ -1,5 +1,4 @@
 import 'dart:io';
-// import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_libserialport/flutter_libserialport.dart';
@@ -16,435 +15,279 @@ class TagSerialResult {
 
 class TagSerialService {
   static const int baudRate = 115200;
-
   static const int _packetLength = 12;
 
+  // 固定500ms待機を廃止し、応答readのtimeoutで待つ。
+  // 正常時は応答が来た時点で即次へ進む。
+  static const int _responseTimeoutMs = 350;
+  static const int _writeTimeoutMs = 1000;
+  static const int _maxAttempts = 3;
+  static const Duration _openSettleDelay = Duration(milliseconds: 100);
+  static const Duration _retryGap = Duration(milliseconds: 80);
+
+  static List<String> get availablePorts => SerialPort.availablePorts;
+
   // ============================================================
-  // 利用可能ポート
+  // TAG PORT CANDIDATES
   // ============================================================
 
-  static List<String> get availablePorts {
-    return SerialPort.availablePorts;
-  }
-
-  // ============================================================
-  // BLEタグらしいシリアルポートを探す
-  //
-  // 今はmacOS実機で確認できた名前を優先。
-  // Windows/Linux対応は後でこの部分を拡張する。
-  // ============================================================
-
-  static String? findTagPort() {
+  static List<String> findTagPortCandidates() {
     final ports = SerialPort.availablePorts;
 
-    debugPrint(
-      'Serial ports: $ports',
-    );
+    debugPrint('Serial ports: $ports');
 
     if (ports.isEmpty) {
-      return null;
+      return const <String>[];
     }
 
     if (Platform.isMacOS) {
-      for (final portName in ports) {
-        final lower =
-            portName.toLowerCase();
-
-        if (lower.contains(
-              'usbserial',
-            ) ||
-            lower.contains(
-              'usbmodem',
-            )) {
-          return portName;
-        }
-      }
-
-      return null;
+      return ports.where((portName) {
+        final lower = portName.toLowerCase();
+        return lower.contains('usbserial') ||
+            lower.contains('usbmodem') ||
+            lower.contains('wchusbserial') ||
+            lower.contains('slab_usbtoUART'.toLowerCase());
+      }).toList();
     }
 
     if (Platform.isLinux) {
-      for (final portName in ports) {
-        final lower =
-            portName.toLowerCase();
-
-        if (lower.contains(
-              'ttyusb',
-            ) ||
-            lower.contains(
-              'ttyacm',
-            )) {
-          return portName;
-        }
-      }
-
-      return null;
+      return ports.where((portName) {
+        final lower = portName.toLowerCase();
+        return lower.contains('ttyusb') || lower.contains('ttyacm');
+      }).toList();
     }
 
     if (Platform.isWindows) {
-      // WindowsはCOMポート名だけでは
-      // タグを一意に特定できないため、
-      // 後で安全なプロトコル確認を追加する。
-      return ports.firstOrNull;
+      // ========================================================
+      // Windows
+      //
+      // BLEタグはCOM3 / COM4に対応する。
+      // COM3・COM4以外のCOMポートにはアクセスしない。
+      // ========================================================
+
+      const allowedPorts = <String>[
+        'COM3',
+        'COM4',
+      ];
+
+      final candidates = ports
+          .where(
+            (portName) => allowedPorts.contains(
+              portName.trim().toUpperCase(),
+            ),
+          )
+          .map(
+            (portName) => portName.trim().toUpperCase(),
+          )
+          .toList();
+
+      return candidates;
     }
 
-    return null;
+    return const <String>[];
+  }
+
+  static String? findTagPort() {
+    final candidates = findTagPortCandidates();
+    return candidates.isEmpty ? null : candidates.first;
   }
 
   // ============================================================
-  // 初期化シーケンス
+  // INITIALIZE
   //
-  // TIME SYNC
-  // ↓
-  // MAC REQUEST
-  // ↓
-  // USB STORAGE REQUEST
-  //
-  // USB Storage切替後はポート自体が消えることがある。
+  // 0x03 USB STORAGE REQUESTは送らない。
+  // タグ側が自動的にStorageへ遷移する前提。
   // ============================================================
 
   static Future<TagSerialResult> initializeTag({
     required String portName,
   }) async {
-    final port =
-        SerialPort(
-      portName,
-    );
-
-    // SerialPortConfig? config;
+    final port = SerialPort(portName);
 
     try {
       if (!port.openReadWrite()) {
         throw Exception(
-          'シリアルポートを'
-          '開けませんでした。\n'
+          'シリアルポートを開けませんでした。\n'
           'port: $portName\n'
-          'error: '
-          '${SerialPort.lastError}',
+          'error: ${SerialPort.lastError}',
         );
       }
 
       final config = SerialPortConfig();
+      config.baudRate = baudRate;
+      config.bits = 8;
+      config.stopBits = 1;
+      config.parity = SerialPortParity.none;
+      config.setFlowControl(SerialPortFlowControl.none);
+      port.config = config;
 
-      config.baudRate =
-          baudRate;
+      debugPrint('Serial opened: $portName');
 
-      config.bits =
-          8;
+      await Future.delayed(_openSettleDelay);
 
-      config.stopBits =
-          1;
-
-      config.parity =
-          SerialPortParity.none;
-
-      config.setFlowControl(
-        SerialPortFlowControl.none,
-      );
-
-      port.config =
-          config;
-
-      debugPrint(
-        'Serial opened: '
-        '$portName',
-      );
-
-      await Future.delayed(
-        const Duration(
-          milliseconds: 300,
-        ),
-      );
-
-      // ========================================================
-      // 1. TIME SYNC
-      // ========================================================
-
-      await _timeSync(
-        port,
-      );
-
-      await Future.delayed(
-        const Duration(
-          milliseconds: 300,
-        ),
-      );
-
-      // ========================================================
-      // 2. MAC
-      // ========================================================
-
-      final macAddress =
-          await _readMac(
-        port,
-      );
-
-      await Future.delayed(
-        const Duration(
-          milliseconds: 300,
-        ),
-      );
-
-      // ========================================================
-      // 3. USB STORAGE
-      // ========================================================
-
-      await _requestUsbStorage(
-        port,
-      );
+      await _timeSyncWithRetry(port);
+      final macAddress = await _readMacWithRetry(port);
 
       return TagSerialResult(
-        portName:
-            portName,
-        macAddress:
-            macAddress,
+        portName: portName,
+        macAddress: macAddress,
       );
     } finally {
-      // USB Storage切替後はデバイス自体が消えるため、
-      // libserialportのclose/disposeが競合する可能性がある。
-      //
-      // まず実機確認のため、ここでは明示的なdisposeを行わない。
-      debugPrint(
-        'Serial cleanup skipped after storage switch',
-      );
+      try {
+        port.close();
+      } catch (e) {
+        debugPrint('Serial close warning: $e');
+      }
+
+      try {
+        port.dispose();
+      } catch (e) {
+        debugPrint('Serial dispose warning: $e');
+      }
     }
   }
 
   // ============================================================
-  // TIME SYNC
+  // TIME SYNC - MAX 3 ATTEMPTS
   // ============================================================
 
-  static Future<void> _timeSync(
-    SerialPort port,
-  ) async {
-    final now =
-        DateTime.now();
+  static Future<void> _timeSyncWithRetry(SerialPort port) async {
+    Object? lastError;
 
-    final year =
-        now.year - 2000;
+    for (int attempt = 1; attempt <= _maxAttempts; attempt++) {
+      try {
+        debugPrint('TIME SYNC attempt $attempt / $_maxAttempts');
+        await _timeSyncOnce(port);
+        debugPrint('TIME SYNC SUCCESS');
+        return;
+      } catch (e) {
+        lastError = e;
+        debugPrint('TIME SYNC attempt $attempt failed: $e');
 
-    if (year < 0 ||
-        year > 255) {
+        if (attempt < _maxAttempts) {
+          await Future.delayed(_retryGap);
+        }
+      }
+    }
+
+    throw Exception(
+      'TIME SYNCに$_maxAttempts回失敗しました。\n'
+      '最後のエラー: $lastError',
+    );
+  }
+
+  static Future<void> _timeSyncOnce(SerialPort port) async {
+    final now = DateTime.now();
+    final year = now.year - 2000;
+
+    if (year < 0 || year > 255) {
       throw Exception(
-        'タグへ設定できない'
-        '年です。\n'
+        'タグへ設定できない年です。\n'
         'year: ${now.year}',
       );
     }
 
-    final payload =
-        <int>[
-      year,
-      now.month,
-      now.day,
-      now.hour,
-      now.minute,
-      now.second,
-    ];
-
-    final packet =
-        _makePacket(
-      command:
-          0x01,
-      payload:
-          payload,
+    final packet = _makePacket(
+      command: 0x01,
+      payload: <int>[
+        year,
+        now.month,
+        now.day,
+        now.hour,
+        now.minute,
+        now.second,
+      ],
     );
 
-    debugPrint(
-      'TIME TX: '
-      '${_hex(packet)}',
-    );
+    debugPrint('TIME TX: ${_hex(packet)}');
+    _writePacket(port, packet);
 
-    _writePacket(
-      port,
-      packet,
-    );
-
-    await Future.delayed(
-      const Duration(
-        milliseconds: 500,
-      ),
-    );
-
-    final response =
-        _readPacket(
-      port,
-    );
-
-    debugPrint(
-      'TIME RX: '
-      '${_hex(response)}',
-    );
+    final response = _readPacket(port);
+    debugPrint('TIME RX: ${_hex(response)}');
 
     _validateHeader(
       response,
-      expectedCommand:
-          0xA1,
+      expectedCommand: 0xA1,
     );
 
-    final status =
-        response[4];
-
+    final status = response[4];
     if (status != 0) {
       throw Exception(
-        'TIME SYNCに'
-        '失敗しました。\n'
-        'status: '
+        'TIME SYNC status error: '
         '0x${status.toRadixString(16).padLeft(2, '0')}',
       );
     }
-
-    debugPrint(
-      'TIME SYNC SUCCESS',
-    );
   }
 
   // ============================================================
-  // MAC REQUEST
-  //
-  // A2応答のbyte 4〜9がMACアドレス
+  // MAC REQUEST - MAX 3 ATTEMPTS
   // ============================================================
 
-  static Future<String> _readMac(
-    SerialPort port,
-  ) async {
-    final packet =
-        _makePacket(
-      command:
-          0x02,
-    );
+  static Future<String> _readMacWithRetry(SerialPort port) async {
+    Object? lastError;
 
-    debugPrint(
-      'MAC TX: '
-      '${_hex(packet)}',
-    );
+    for (int attempt = 1; attempt <= _maxAttempts; attempt++) {
+      try {
+        debugPrint('MAC REQUEST attempt $attempt / $_maxAttempts');
+        final mac = _readMacOnce(port);
+        debugPrint('MAC REQUEST SUCCESS: $mac');
+        return mac;
+      } catch (e) {
+        lastError = e;
+        debugPrint('MAC REQUEST attempt $attempt failed: $e');
 
-    _writePacket(
-      port,
-      packet,
-    );
+        if (attempt < _maxAttempts) {
+          await Future.delayed(_retryGap);
+        }
+      }
+    }
 
-    await Future.delayed(
-      const Duration(
-        milliseconds: 500,
-      ),
+    throw Exception(
+      'MAC REQUESTに$_maxAttempts回失敗しました。\n'
+      '最後のエラー: $lastError',
     );
+  }
 
-    final response =
-        _readPacket(
-      port,
-    );
+  static String _readMacOnce(SerialPort port) {
+    final packet = _makePacket(command: 0x02);
 
-    debugPrint(
-      'MAC RX: '
-      '${_hex(response)}',
-    );
+    debugPrint('MAC TX: ${_hex(packet)}');
+    _writePacket(port, packet);
+
+    final response = _readPacket(port);
+    debugPrint('MAC RX: ${_hex(response)}');
 
     _validateHeader(
       response,
-      expectedCommand:
-          0xA2,
+      expectedCommand: 0xA2,
     );
 
-    final macBytes =
-        response.sublist(
-      4,
-      10,
-    );
-
-    final mac =
-        macBytes
-            .map(
-              (value) =>
-                  value
-                      .toRadixString(
-                        16,
-                      )
-                      .padLeft(
-                        2,
-                        '0',
-                      )
-                      .toUpperCase(),
-            )
-            .join(':');
-
-    debugPrint(
-      'TAG MAC: $mac',
-    );
-
-    return mac;
-  }
-
-  // ============================================================
-  // USB STORAGE
-  //
-  // 成功するとシリアルポートが消えるため、
-  // 応答が返らなくても異常とは限らない。
-  // ============================================================
-
-  static Future<void> _requestUsbStorage(
-    SerialPort port,
-  ) async {
-    final packet =
-        _makePacket(
-      command:
-          0x03,
-    );
-
-    debugPrint(
-      'STORAGE TX: '
-      '${_hex(packet)}',
-    );
-
-    _writePacket(
-      port,
-      packet,
-    );
-
-    debugPrint(
-      'USB STORAGE REQUEST SENT',
-    );
-
-    // ここでは応答を待たない。
-    //
-    // Python実機試験で
-    // Storage切替成功時に
-    // シリアルデバイス自体が消えることを確認済み。
+    final macBytes = response.sublist(4, 10);
+    return macBytes
+        .map(
+          (value) => value
+              .toRadixString(16)
+              .padLeft(2, '0')
+              .toUpperCase(),
+        )
+        .join(':');
   }
 
   // ============================================================
   // PACKET
-  //
-  // 12 bytes
-  //
-  // A5 FA
-  // 09
-  // command
-  // payload 6byte
-  // CRC16 2byte little endian
   // ============================================================
 
   static Uint8List _makePacket({
     required int command,
     List<int>? payload,
   }) {
-    final actualPayload =
-        payload ??
-            List<int>.filled(
-              6,
-              0,
-            );
+    final actualPayload = payload ?? List<int>.filled(6, 0);
 
-    if (actualPayload.length !=
-        6) {
-      throw ArgumentError(
-        'payloadは6byte'
-        '必要です。',
-      );
+    if (actualPayload.length != 6) {
+      throw ArgumentError('payloadは6byte必要です。');
     }
 
-    final first10 =
-        <int>[
+    final first10 = <int>[
       0xA5,
       0xFA,
       0x09,
@@ -452,55 +295,26 @@ class TagSerialService {
       ...actualPayload,
     ];
 
-    final crc =
-        _crc16Ccitt(
-      first10,
-    );
+    final crc = _crc16Ccitt(first10);
 
-    return Uint8List.fromList(
-      [
-        ...first10,
-
-        // little endian
-        crc & 0xFF,
-        (crc >> 8) & 0xFF,
-      ],
-    );
+    return Uint8List.fromList(<int>[
+      ...first10,
+      crc & 0xFF,
+      (crc >> 8) & 0xFF,
+    ]);
   }
 
-  // ============================================================
-  // CRC-16/CCITT
-  //
-  // polynomial = 0x1021
-  // initial    = 0x0000
-  // ============================================================
+  static int _crc16Ccitt(List<int> data) {
+    int crc = 0x0000;
 
-  static int _crc16Ccitt(
-    List<int> data,
-  ) {
-    int crc =
-        0x0000;
+    for (final byte in data) {
+      crc ^= byte << 8;
 
-    for (final byte
-        in data) {
-      crc ^=
-          byte << 8;
-
-      for (
-        int i = 0;
-        i < 8;
-        i++
-      ) {
-        if ((crc & 0x8000) !=
-            0) {
-          crc =
-              ((crc << 1) ^
-                      0x1021) &
-                  0xFFFF;
+      for (int i = 0; i < 8; i++) {
+        if ((crc & 0x8000) != 0) {
+          crc = ((crc << 1) ^ 0x1021) & 0xFFFF;
         } else {
-          crc =
-              (crc << 1) &
-                  0xFFFF;
+          crc = (crc << 1) & 0xFFFF;
         }
       }
     }
@@ -509,58 +323,40 @@ class TagSerialService {
   }
 
   // ============================================================
-  // WRITE
+  // WRITE / READ
   // ============================================================
 
   static void _writePacket(
     SerialPort port,
     Uint8List packet,
   ) {
-    final written =
-        port.write(
+    final written = port.write(
       packet,
-      timeout:
-          2000,
+      timeout: _writeTimeoutMs,
     );
 
-    if (written !=
-        packet.length) {
+    if (written != packet.length) {
       throw Exception(
-        'シリアル送信に'
-        '失敗しました。\n'
-        'expected: '
-        '${packet.length}\n'
-        'written: '
-        '$written',
+        'シリアル送信に失敗しました。\n'
+        'expected: ${packet.length}\n'
+        'written: $written',
       );
     }
 
     port.drain();
   }
 
-  // ============================================================
-  // READ
-  // ============================================================
-
-  static Uint8List _readPacket(
-    SerialPort port,
-  ) {
-    final data =
-        port.read(
+  static Uint8List _readPacket(SerialPort port) {
+    final data = port.read(
       _packetLength,
-      timeout:
-          2000,
+      timeout: _responseTimeoutMs,
     );
 
-    if (data.length !=
-        _packetLength) {
+    if (data.length != _packetLength) {
       throw Exception(
-        'タグからの応答が'
-        '不完全です。\n'
-        'expected: '
-        '$_packetLength bytes\n'
-        'received: '
-        '${data.length} bytes',
+        'タグからの応答が不完全です。\n'
+        'expected: $_packetLength bytes\n'
+        'received: ${data.length} bytes',
       );
     }
 
@@ -568,98 +364,48 @@ class TagSerialService {
   }
 
   // ============================================================
-  // RESPONSE VALIDATION
+  // VALIDATION
   // ============================================================
 
   static void _validateHeader(
     Uint8List response, {
     required int expectedCommand,
   }) {
-    if (response.length !=
-        _packetLength) {
-      throw Exception(
-        'タグ応答長が'
-        '不正です。',
-      );
+    if (response.length != _packetLength) {
+      throw Exception('タグ応答長が不正です。');
     }
 
-    if (response[0] !=
-            0xA5 ||
-        response[1] !=
-            0xFA ||
-        response[2] !=
-            0x09 ||
-        response[3] !=
-            expectedCommand) {
+    if (response[0] != 0xA5 ||
+        response[1] != 0xFA ||
+        response[2] != 0x09 ||
+        response[3] != expectedCommand) {
       throw Exception(
-        'タグから想定外の'
-        '応答を受信しました。\n'
+        'タグから想定外の応答を受信しました。\n'
+        'expected command: '
+        '0x${expectedCommand.toRadixString(16).toUpperCase()}\n'
         'RX: ${_hex(response)}',
       );
     }
 
-    // ----------------------------------------------------------
-    // CRC確認
-    // ----------------------------------------------------------
+    final calculatedCrc = _crc16Ccitt(response.sublist(0, 10));
+    final receivedCrc = response[10] | (response[11] << 8);
 
-    final calculatedCrc =
-        _crc16Ccitt(
-      response.sublist(
-        0,
-        10,
-      ),
-    );
-
-    final receivedCrc =
-        response[10] |
-            (response[11]
-                << 8);
-
-    if (calculatedCrc !=
-        receivedCrc) {
+    if (calculatedCrc != receivedCrc) {
       throw Exception(
-        'タグ応答のCRCが'
-        '一致しません。\n'
+        'タグ応答のCRCが一致しません。\n'
         'RX: ${_hex(response)}',
       );
     }
   }
 
-  // ============================================================
-  // HEX
-  // ============================================================
-
-  static String _hex(
-    List<int> data,
-  ) {
+  static String _hex(List<int> data) {
     return data
         .map(
-          (value) =>
-              value
-                  .toRadixString(
-                    16,
-                  )
-                  .padLeft(
-                    2,
-                    '0',
-                  )
-                  .toUpperCase(),
+          (value) => value
+              .toRadixString(16)
+              .padLeft(2, '0')
+              .toUpperCase(),
         )
         .join(' ');
-  }
-}
-
-// ============================================================
-// Dart 3以前でも使えるように補助
-// ============================================================
-
-extension _FirstOrNullExtension<T>
-    on List<T> {
-  T? get firstOrNull {
-    if (isEmpty) {
-      return null;
-    }
-
-    return first;
   }
 }

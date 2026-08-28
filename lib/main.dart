@@ -15,25 +15,18 @@ import 'services/usb_monitor_service.dart';
 import 'services/safe_eject_service.dart';
 import 'services/log_parser.dart';
 
+enum SignageViewState { waiting, processing, growth, bloom, complete, error }
 
-enum SignageViewState {
-  waiting,
-  processing,
-  growth,
-  bloom,
-  complete,
+class _ProcessingCancelled implements Exception {
+  const _ProcessingCancelled();
 }
 
 void main() {
-  runApp(
-    const FlowerSignageApp(),
-  );
+  runApp(const FlowerSignageApp());
 }
 
 class FlowerSignageApp extends StatelessWidget {
-  const FlowerSignageApp({
-    super.key,
-  });
+  const FlowerSignageApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -46,17 +39,13 @@ class FlowerSignageApp extends StatelessWidget {
 }
 
 class TagFolderScreen extends StatefulWidget {
-  const TagFolderScreen({
-    super.key,
-  });
+  const TagFolderScreen({super.key});
 
   @override
-  State<TagFolderScreen> createState() =>
-      _TagFolderScreenState();
+  State<TagFolderScreen> createState() => _TagFolderScreenState();
 }
 
-class _TagFolderScreenState
-    extends State<TagFolderScreen> {
+class _TagFolderScreenState extends State<TagFolderScreen> {
   // ============================================================
   // CONFIG
   // ============================================================
@@ -137,13 +126,13 @@ class _TagFolderScreenState
 
   int deletedLogCount = 0;
 
-  SignageViewState signageViewState =
-      SignageViewState.waiting;
+  SignageViewState signageViewState = SignageViewState.waiting;
 
   int lastStageDelta = 0;
 
   Timer? _resultDisplayTimer;
   Timer? _returnToWaitingTimer;
+  Timer? _errorDisplayTimer;
 
   // ============================================================
   // USB
@@ -151,10 +140,20 @@ class _TagFolderScreenState
 
   UsbMonitorService? usbMonitor;
 
-  String usbStatus =
-      'BLEタグを接続してください';
+  String usbStatus = 'BLEタグを接続してください';
 
   bool isAutoProcessing = false;
+
+  // 接続処理ごとの世代番号。物理抜線時に進めることで、
+  // 以前の非同期処理を無効化する。
+  int _processingGeneration = 0;
+
+  // 正常処理がDB COMMITまで完了したか。
+  bool _processingCommitted = false;
+
+  // USB由来エラーでは、エラー表示後から物理抜線を継続監視し、
+  // 1回でも物理抜線を確認したら即待機画面へ戻す。
+  // 初期化などUSBと無関係なエラーだけは15秒後に待機へ戻す。
 
   // ============================================================
   // INIT
@@ -169,56 +168,39 @@ class _TagFolderScreenState
 
   Future<void> _initialize() async {
     try {
-      debugPrint(
-        '=== INITIALIZE START ===',
-      );
+      debugPrint('=== INITIALIZE START ===');
 
       // ----------------------------------------------------------
       // SQLite
       // ----------------------------------------------------------
 
-      debugPrint(
-        '[INIT 1] SQLite...',
-      );
+      debugPrint('[INIT 1] SQLite...');
 
-      final dbOk =
-          await DatabaseService.instance
-              .testConnection();
+      final dbOk = await DatabaseService.instance.testConnection();
 
       if (!dbOk) {
-        throw Exception(
-          'SQLiteデータベースを初期化できませんでした。',
-        );
+        throw Exception('SQLiteデータベースを初期化できませんでした。');
       }
 
-      debugPrint(
-        '[INIT 1] SQLite OK',
-      );
+      debugPrint('[INIT 1] SQLite OK');
 
       // ----------------------------------------------------------
       // Config
       // ----------------------------------------------------------
 
-      final loadedConfig =
-          await ConfigService.loadConfig();
+      final loadedConfig = await ConfigService.loadConfig();
 
       if (loadedConfig.debugLogging) {
-        debugPrint(
-          '[INIT 2] Config OK',
-        );
+        debugPrint('[INIT 2] Config OK');
 
-        debugPrint(
-          loadedConfig.toString(),
-        );
+        debugPrint(loadedConfig.toString());
       }
 
       // ----------------------------------------------------------
       // Checkpoints
       // ----------------------------------------------------------
 
-      final loadedCheckpoints =
-          await CheckpointService
-              .loadCheckpoints();
+      final loadedCheckpoints = await CheckpointService.loadCheckpoints();
 
       if (loadedConfig.debugLogging) {
         debugPrint(
@@ -231,9 +213,7 @@ class _TagFolderScreenState
       // Users
       // ----------------------------------------------------------
 
-      final loadedUsers =
-          await InteractionService
-              .loadUsers();
+      final loadedUsers = await InteractionService.loadUsers();
 
       if (loadedConfig.debugLogging) {
         debugPrint(
@@ -249,40 +229,22 @@ class _TagFolderScreenState
       setState(() {
         config = loadedConfig;
 
-        checkpoints =
-            loadedCheckpoints;
+        checkpoints = loadedCheckpoints;
 
-        registeredUsers =
-            loadedUsers;
+        registeredUsers = loadedUsers;
       });
 
       _startUsbMonitor();
 
       if (loadedConfig.debugLogging) {
-        debugPrint(
-          '=== INITIALIZE COMPLETE ===',
-        );
+        debugPrint('=== INITIALIZE COMPLETE ===');
       }
     } catch (e, stackTrace) {
-      debugPrint(
-        'INITIALIZE ERROR: $e',
+      await _handleGlobalError(
+        Exception('初期化に失敗しました。\n$e'),
+        stackTrace: stackTrace,
+        lockUsbUntilRemoval: false,
       );
-
-      debugPrint(
-        '$stackTrace',
-      );
-
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        errorMessage =
-            '初期化に失敗しました。\n\n$e';
-
-        processStatus =
-            '初期化エラー';
-      });
     }
   }
 
@@ -294,37 +256,42 @@ class _TagFolderScreenState
     usbMonitor?.stop();
 
     if (config == null) {
-      throw Exception(
-        'USB監視開始時にConfigが'
-        '読み込まれていません。',
-      );
+      throw Exception('USB監視開始時にConfigが読み込まれていません。');
     }
 
-    usbMonitor =
-        UsbMonitorService(
-      interval: Duration(
-        seconds:
-            config!.usbPollSeconds,
-      ),
+    usbMonitor = UsbMonitorService(
+      interval: Duration(seconds: config!.usbPollSeconds),
+      disconnectMissThreshold: config!.disconnectMissThreshold,
 
-      disconnectMissThreshold:
-          config!
-              .disconnectMissThreshold,
+      onSerialDetected: (portName) {
+        if (!mounted) {
+          return;
+        }
 
-      onTagConnected:
-          (folderPath) async {
+        _resultDisplayTimer?.cancel();
+        _returnToWaitingTimer?.cancel();
+        _errorDisplayTimer?.cancel();
+
+        setState(() {
+          signageViewState = SignageViewState.processing;
+          usbStatus = 'タグを抜かないでください';
+          processStatus = 'タグ検出 ($portName)';
+          errorMessage = null;
+        });
+      },
+
+      onTagConnected: (folderPath) async {
         if (config!.debugLogging) {
-          debugPrint(
-            'USB CONNECTED: '
-            '$folderPath',
-          );
+          debugPrint('USB CONNECTED: $folderPath');
         }
 
         if (isAutoProcessing) {
           return;
         }
 
+        final generation = ++_processingGeneration;
         isAutoProcessing = true;
+        _processingCommitted = false;
 
         try {
           if (!mounted) {
@@ -333,168 +300,220 @@ class _TagFolderScreenState
 
           _resultDisplayTimer?.cancel();
           _returnToWaitingTimer?.cancel();
+          _errorDisplayTimer?.cancel();
 
           setState(() {
-            signageViewState =
-                SignageViewState.processing;
-
-            usbStatus =
-                'タグを抜かないでください';
-
-            processStatus =
-                'USBタグ検出';
-
-            errorMessage =
-                null;
-
-            deletedLogCount =
-                0;
+            signageViewState = SignageViewState.processing;
+            usbStatus = 'タグを抜かないでください';
+            processStatus = 'USBタグ読込中';
+            errorMessage = null;
+            deletedLogCount = 0;
           });
 
-          await _processTagFolder(
-            folderPath,
-          );
+          await _processTagFolder(folderPath, processingGeneration: generation);
+
+          _throwIfProcessingCancelled(generation);
+          _processingCommitted = true;
 
           if (!mounted) {
             return;
           }
 
-          // ==========================================================
-          // 全処理成功後に安全な取り外し
-          // ==========================================================
-
           setState(() {
-            usbStatus =
-                '処理が完了しました\n'
-                'タグを安全に取り外しています...';
-
-            processStatus =
-                'USB安全取り外し中';
+            usbStatus = '処理が完了しました\nタグを安全に取り外しています...';
+            processStatus = 'USB安全取り外し中';
           });
 
-          await SafeEjectService.eject(
-            folderPath,
-          );
+          await SafeEjectService.eject(folderPath);
 
-          // 物理抜線は待たない。
-          // 現在タグの監視状態を解除し、次に検出されたタグを
-          // 新しい処理対象として受け付ける。
+          _throwIfProcessingCancelled(generation);
+
+          // Safe Eject完了後、結果表示開始と同時に物理抜線監視を開始する。
+          // 以後は1回でも物理USB不在を検出したら即待機へ戻る。
           usbMonitor?.completeSafeEject();
 
           if (!mounted) {
             return;
           }
 
-          // Eject完了後に結果を表示する。
-          // 結果表示中でも新しいタグを検出したら、
-          // onTagConnected側でタイマーを止めてPROCESSINGへ移る。
           _showResultAfterSafeEject();
-        } catch (e, stackTrace) {
+        } on _ProcessingCancelled {
           if (config!.debugLogging) {
-            debugPrint(
-              'USB PROCESS ERROR: $e',
-            );
-
-            debugPrint(
-              '$stackTrace',
-            );
+            debugPrint('================================');
+            debugPrint('CURRENT TAG PROCESS CANCELLED');
+            debugPrint('Result display = SKIPPED');
+            debugPrint('Next connection starts from beginning');
+            debugPrint('================================');
           }
-
-          if (!mounted) {
+        } catch (e, stackTrace) {
+          // 物理抜線で無効化された古い処理から返ったI/Oエラーは表示しない。
+          if (generation != _processingGeneration) {
+            if (config!.debugLogging) {
+              debugPrint('IGNORED ERROR FROM CANCELLED PROCESS: $e');
+            }
             return;
           }
 
-          setState(() {
-            usbStatus =
-                '処理に失敗しました';
-
-            errorMessage =
-                '$e';
-
-            processStatus =
-                'エラー';
-
-            isLoading =
-                false;
-          });
+          await _handleGlobalError(
+            e,
+            stackTrace: stackTrace,
+            lockUsbUntilRemoval: true,
+          );
         } finally {
-          isAutoProcessing = false;
+          if (generation == _processingGeneration) {
+            isAutoProcessing = false;
+          }
         }
       },
 
       onTagDisconnected: () {
         if (config!.debugLogging) {
-          debugPrint(
-            'USB PHYSICALLY DISCONNECTED',
-          );
+          debugPrint('USB PHYSICALLY DISCONNECTED');
         }
 
         if (!mounted) {
           return;
         }
 
-        // ========================================================
-        // Eject前に予期せずStorageが切断された場合の復帰処理。
-        // 正常Eject後は物理抜線を追跡しない。
-        // ========================================================
+        if (signageViewState == SignageViewState.error) {
+          // エラー表示後は物理抜線を継続監視している。
+          // 1回でも抜線が確認された時点で即待機画面へ戻す。
+          _resetUiToWaiting();
+          return;
+        }
 
-        _resultDisplayTimer?.cancel();
-        _returnToWaitingTimer?.cancel();
+        // 処理完了前に抜かれた場合：結果を出さず、古い処理を無効化して待機へ。
+        if (isAutoProcessing && !_processingCommitted) {
+          _processingGeneration++;
+          isAutoProcessing = false;
 
-        setState(() {
-          signageViewState =
-              SignageViewState.waiting;
+          if (config!.debugLogging) {
+            debugPrint('================================');
+            debugPrint('PROCESS CANCEL REQUESTED');
+            debugPrint('Return to waiting screen');
+            debugPrint('================================');
+          }
 
-          usbStatus =
-              'タグを接続してください';
+          _resetUiToWaiting();
+          return;
+        }
 
-          processStatus =
-              '待機中';
+        // 正常処理後の物理抜線。
+        _resetUiToWaiting();
+      },
 
-          errorMessage =
-              null;
-
-          tagResult =
-              null;
-
-          checkpointHits =
-              [];
-
-          interactionHits =
-              [];
-
-          seedInventory =
-              [];
-
-          activeFlowersByType = {};
-          resultDisplayStages = {};
-          resultStageDeltas = {};
-          bloomCounts = {};
-          unusedSeedCounts = {};
-
-          newlyAddedSeeds.clear();
-          alreadyOwnedSeeds.clear();
-
-          alreadyImported =
-              false;
-
-          currentImportHash =
-              null;
-
-          deletedLogCount =
-              0;
-
-          lastStageDelta =
-              0;
-
-          isLoading =
-              false;
-
-        });
+      onError: (error, stackTrace) {
+        _handleGlobalError(
+          error,
+          stackTrace: stackTrace,
+          lockUsbUntilRemoval: true,
+        );
       },
     );
 
     usbMonitor!.start();
+  }
+
+  void _throwIfProcessingCancelled(int? generation) {
+    if (generation == null) {
+      return;
+    }
+
+    if (generation != _processingGeneration) {
+      throw const _ProcessingCancelled();
+    }
+  }
+
+  // ============================================================
+  // COMMON ERROR / WAITING RESET
+  // ============================================================
+
+  Future<void> _handleGlobalError(
+    Object error, {
+    StackTrace? stackTrace,
+    bool lockUsbUntilRemoval = false,
+  }) async {
+    debugPrint('================================');
+    debugPrint('SIGNAGE ERROR');
+    debugPrint('$error');
+
+    if (stackTrace != null) {
+      debugPrint('$stackTrace');
+    }
+
+    debugPrint('================================');
+
+    _resultDisplayTimer?.cancel();
+    _returnToWaitingTimer?.cancel();
+    _errorDisplayTimer?.cancel();
+
+    if (lockUsbUntilRemoval) {
+      // エラー表示後から物理抜線を継続監視する。
+      // 1回でも不在になればUsbMonitorServiceから
+      // onTagDisconnected()が呼ばれ、即待機画面へ戻る。
+      usbMonitor?.lockUntilPhysicalRemovalAfterError();
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      signageViewState = SignageViewState.error;
+      usbStatus = 'エラーが発生しました';
+      processStatus = lockUsbUntilRemoval ? '一度タグを抜いてください' : 'エラー';
+      errorMessage = '$error';
+      isLoading = false;
+    });
+
+    // USBと無関係な初期化エラーなどだけは、
+    // 従来どおり15秒後に待機画面へ戻す。
+    // USB由来エラーはタイマーでは戻さず、物理抜線まで表示を続ける。
+    if (!lockUsbUntilRemoval) {
+      _errorDisplayTimer = Timer(const Duration(seconds: 15), () {
+        if (!mounted || signageViewState != SignageViewState.error) {
+          return;
+        }
+        _resetUiToWaiting();
+      });
+    }
+  }
+
+  void _resetUiToWaiting() {
+    _resultDisplayTimer?.cancel();
+    _returnToWaitingTimer?.cancel();
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      signageViewState = SignageViewState.waiting;
+      usbStatus = 'BLEタグを接続してください';
+      processStatus = '待機中';
+      errorMessage = null;
+
+      tagResult = null;
+      checkpointHits = [];
+      interactionHits = [];
+      seedInventory = [];
+      activeFlowersByType = {};
+      resultDisplayStages = {};
+      resultStageDeltas = {};
+      bloomCounts = {};
+      unusedSeedCounts = {};
+
+      newlyAddedSeeds.clear();
+      alreadyOwnedSeeds.clear();
+
+      alreadyImported = false;
+      currentImportHash = null;
+      deletedLogCount = 0;
+      lastStageDelta = 0;
+      isLoading = false;
+      _processingCommitted = false;
+
+    });
   }
 
   @override
@@ -502,6 +521,7 @@ class _TagFolderScreenState
     usbMonitor?.stop();
     _resultDisplayTimer?.cancel();
     _returnToWaitingTimer?.cancel();
+    _errorDisplayTimer?.cancel();
 
     super.dispose();
   }
@@ -510,12 +530,9 @@ class _TagFolderScreenState
   // MANUAL FOLDER
   // ============================================================
 
-  Future<void>
-      selectTagFolder() async {
+  Future<void> selectTagFolder() async {
     try {
-      final folderPath =
-          await FilePicker
-              .getDirectoryPath();
+      final folderPath = await FilePicker.getDirectoryPath();
 
       if (folderPath == null) {
         return;
@@ -526,43 +543,19 @@ class _TagFolderScreenState
         _returnToWaitingTimer?.cancel();
 
         setState(() {
-          signageViewState =
-              SignageViewState.processing;
+          signageViewState = SignageViewState.processing;
 
-          usbStatus =
-              'タグを抜かないでください';
+          usbStatus = 'タグを抜かないでください';
         });
       }
 
-      await _processTagFolder(
-        folderPath,
-      );
+      await _processTagFolder(folderPath);
     } catch (e, stackTrace) {
-      if (config?.debugLogging ??
-          true) {
-        debugPrint(
-          'MANUAL ERROR: $e',
-        );
-
-        debugPrint(
-          '$stackTrace',
-        );
-      }
-
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        errorMessage =
-            '$e';
-
-        processStatus =
-            '手動読込エラー';
-
-        isLoading =
-            false;
-      });
+      await _handleGlobalError(
+        e,
+        stackTrace: stackTrace,
+        lockUsbUntilRemoval: false,
+      );
     }
   }
 
@@ -571,8 +564,9 @@ class _TagFolderScreenState
   // ============================================================
 
   Future<void> _processTagFolder(
-    String folderPath,
-  ) async {
+    String folderPath, {
+    int? processingGeneration,
+  }) async {
     if (config == null) {
       throw Exception(
         '設定ファイルが'
@@ -612,11 +606,9 @@ class _TagFolderScreenState
 
         lastStageDelta = 0;
 
-        selectedFolder =
-            folderPath;
+        selectedFolder = folderPath;
 
-        processStatus =
-            '[1] LOG読込中';
+        processStatus = '[1] LOG読込中';
       });
     }
 
@@ -625,24 +617,18 @@ class _TagFolderScreenState
     // ==========================================================
 
     if (cfg.debugLogging) {
-      debugPrint(
-        '================================',
-      );
+      debugPrint('================================');
 
-      debugPrint(
-        '[1] Reading tag folder...',
-      );
+      debugPrint('[1] Reading tag folder...');
     }
 
-    final result =
-        await TagFolderService
-            .loadFolder(
-      folderPath,
-    );
+    final result = await TagFolderService.loadFolder(folderPath);
+
+    _throwIfProcessingCancelled(processingGeneration);
 
     // final growthValue =
     //     result.uniqueAddresses.length;
-    
+
     // ==========================================================
     // USER + INITIAL SEEDS
     //
@@ -650,14 +636,13 @@ class _TagFolderScreenState
     // 処理済みLOGでも初期種を保証する。
     // ==========================================================
 
-    await DatabaseService.instance
-        .upsertUser(
-      userId:
-          result.userInfo.userId,
+    await DatabaseService.instance.upsertUser(
+      userId: result.userInfo.userId,
 
-      tagMac:
-          result.userInfo.macAddress,
+      tagMac: result.userInfo.macAddress,
     );
+
+    _throwIfProcessingCancelled(processingGeneration);
 
     // await DatabaseService.instance
     //     .ensureInitialSeeds(
@@ -694,22 +679,15 @@ class _TagFolderScreenState
     // ==========================================================
 
     if (result.logFiles.isEmpty) {
-      final currentFlowers =
-          await DatabaseService.instance.getActiveFlowersByType(
+      final currentFlowers = await DatabaseService.instance
+          .getActiveFlowersByType(result.userInfo.userId);
+      final currentBloomCounts = await DatabaseService.instance.getBloomCounts(
         result.userInfo.userId,
       );
-      final currentBloomCounts =
-          await DatabaseService.instance.getBloomCounts(
-        result.userInfo.userId,
-      );
-      final currentUnusedSeedCounts =
-          await DatabaseService.instance.getUnusedSeedCounts(
-        result.userInfo.userId,
-      );
+      final currentUnusedSeedCounts = await DatabaseService.instance
+          .getUnusedSeedCounts(result.userInfo.userId);
 
-      final seeds =
-          await DatabaseService.instance
-              .getSeeds(
+      final seeds = await DatabaseService.instance.getSeeds(
         result.userInfo.userId,
       );
 
@@ -718,11 +696,9 @@ class _TagFolderScreenState
       }
 
       setState(() {
-        tagResult =
-            result;
+        tagResult = result;
 
-        seedInventory =
-            seeds;
+        seedInventory = seeds;
 
         activeFlowersByType = currentFlowers;
         resultDisplayStages = {
@@ -736,48 +712,32 @@ class _TagFolderScreenState
         checkpointHits = [];
         interactionHits = [];
 
-        alreadyImported =
-            false;
+        alreadyImported = false;
 
-        deletedLogCount =
-            0;
+        deletedLogCount = 0;
 
-        processStatus =
-            '新しいLOGはありません';
+        processStatus = '新しいLOGはありません';
 
-        isLoading =
-            false;
+        isLoading = false;
       });
 
       if (cfg.debugLogging) {
-        debugPrint(
-          '================================',
-        );
+        debugPrint('================================');
 
-        debugPrint(
-          '=== NO LOG FILES ===',
-        );
+        debugPrint('=== NO LOG FILES ===');
 
         debugPrint(
           'User = '
           '${result.userInfo.userId}',
         );
 
-        debugPrint(
-          'LOG count = 0',
-        );
+        debugPrint('LOG count = 0');
 
-        debugPrint(
-          'Growth update = SKIPPED',
-        );
+        debugPrint('Growth update = SKIPPED');
 
-        debugPrint(
-          'Active flowers = $currentFlowers',
-        );
+        debugPrint('Active flowers = $currentFlowers');
 
-        debugPrint(
-          '================================',
-        );
+        debugPrint('================================');
       }
 
       return;
@@ -790,14 +750,20 @@ class _TagFolderScreenState
     final newLogFiles = <File>[];
     final knownLogFiles = <File>[];
 
-    for (final logFile in result.logFiles) {
-      final fileHash =
-          await TagFolderService.calculateLogHash(
-        logFile,
-      );
+    // 高速化:
+    // SHA-256はここで1回だけ計算し、後段のarchiveでも再利用する。
+    final logHashByPath = <String, String>{};
 
-      final exists =
-          await DatabaseService.instance.hasLogHash(
+    for (final logFile in result.logFiles) {
+      _throwIfProcessingCancelled(processingGeneration);
+
+      final fileHash = await TagFolderService.calculateLogHash(logFile);
+
+      _throwIfProcessingCancelled(processingGeneration);
+
+      logHashByPath[logFile.path] = fileHash;
+
+      final exists = await DatabaseService.instance.hasLogHash(
         userId: result.userInfo.userId,
         fileHash: fileHash,
       );
@@ -809,92 +775,54 @@ class _TagFolderScreenState
       }
     }
 
-    debugPrint(
-      '================================',
-    );
+    debugPrint('================================');
 
-    debugPrint(
-      '=== LOG HASH CHECK ===',
-    );
+    debugPrint('=== LOG HASH CHECK ===');
 
-    debugPrint(
-      'Total LOG = ${result.logFiles.length}',
-    );
+    debugPrint('Total LOG = ${result.logFiles.length}');
 
-    debugPrint(
-      'Already known = ${knownLogFiles.length}',
-    );
+    debugPrint('Already known = ${knownLogFiles.length}');
 
-    debugPrint(
-      'New LOG = ${newLogFiles.length}',
-    );
+    debugPrint('New LOG = ${newLogFiles.length}');
 
-    debugPrint(
-      '================================',
-    );
-        
+    debugPrint('================================');
+
     // ==========================================================
     // 今回の新規LOGだけを処理対象にする
     // ==========================================================
 
-    final newLogPaths =
-        newLogFiles
-            .map((file) => file.path)
-            .toSet();
+    final newLogPaths = newLogFiles.map((file) => file.path).toSet();
 
-    final newLogResults =
-        <LogParseResult>[];
+    final newLogResults = <LogParseResult>[];
 
-    for (int i = 0;
-        i < result.logFiles.length;
-        i++) {
-      final file =
-          result.logFiles[i];
+    for (int i = 0; i < result.logFiles.length; i++) {
+      final file = result.logFiles[i];
 
-      if (newLogPaths.contains(
-        file.path,
-      )) {
-        newLogResults.add(
-          result.logResults[i],
-        );
+      if (newLogPaths.contains(file.path)) {
+        newLogResults.add(result.logResults[i]);
       }
     }
 
     // 今回の新規LOGだけの全レコード
-    final newRecords =
-        newLogResults
-            .expand(
-              (logResult) =>
-                  logResult.records,
-            )
-            .toList();
+    final newRecords = newLogResults
+        .expand((logResult) => logResult.records)
+        .toList();
 
     // 今回の新規LOGだけのユニークMAC
-    final newUniqueAddresses =
-        newRecords
-            .map(
-              (record) =>
-                  record.address,
-            )
-            .toSet();
+    final newUniqueAddresses = newRecords
+        .map((record) => record.address)
+        .toSet();
 
-    final newRecordCount =
-        newRecords.length;
+    final newRecordCount = newRecords.length;
 
-    final growthValue =
-        cfg.growthMetric ==
-                'detection_count'
-            ? newRecordCount
-            : newUniqueAddresses.length;
+    final growthValue = cfg.growthMetric == 'detection_count'
+        ? newRecordCount
+        : newUniqueAddresses.length;
 
     if (cfg.debugLogging) {
-      debugPrint(
-        '================================',
-      );
+      debugPrint('================================');
 
-      debugPrint(
-        '=== NEW LOG DATA ===',
-      );
+      debugPrint('=== NEW LOG DATA ===');
 
       debugPrint(
         'New records = '
@@ -911,41 +839,30 @@ class _TagFolderScreenState
         '$growthValue',
       );
 
-      debugPrint(
-        '================================',
-      );
+      debugPrint('================================');
     }
 
     if (newLogFiles.isEmpty) {
-      final seeds =
-          await DatabaseService.instance
-              .getSeeds(
+      final seeds = await DatabaseService.instance.getSeeds(
         result.userInfo.userId,
       );
 
-      final currentFlowers =
-          await DatabaseService.instance.getActiveFlowersByType(
+      final currentFlowers = await DatabaseService.instance
+          .getActiveFlowersByType(result.userInfo.userId);
+      final currentBloomCounts = await DatabaseService.instance.getBloomCounts(
         result.userInfo.userId,
       );
-      final currentBloomCounts =
-          await DatabaseService.instance.getBloomCounts(
-        result.userInfo.userId,
-      );
-      final currentUnusedSeedCounts =
-          await DatabaseService.instance.getUnusedSeedCounts(
-        result.userInfo.userId,
-      );
+      final currentUnusedSeedCounts = await DatabaseService.instance
+          .getUnusedSeedCounts(result.userInfo.userId);
 
       if (!mounted) {
         return;
       }
 
       setState(() {
-        tagResult =
-            result;
+        tagResult = result;
 
-        seedInventory =
-            seeds;
+        seedInventory = seeds;
 
         activeFlowersByType = currentFlowers;
         resultDisplayStages = {
@@ -959,43 +876,27 @@ class _TagFolderScreenState
         checkpointHits = [];
         interactionHits = [];
 
-        alreadyImported =
-            true;
+        alreadyImported = true;
 
-        deletedLogCount =
-            0;
+        deletedLogCount = 0;
 
-        processStatus =
-            '新しいLOGはありません';
+        processStatus = '新しいLOGはありません';
 
-        isLoading =
-            false;
+        isLoading = false;
       });
 
       if (cfg.debugLogging) {
-        debugPrint(
-          '================================',
-        );
+        debugPrint('================================');
 
-        debugPrint(
-          '=== NO NEW LOG ===',
-        );
+        debugPrint('=== NO NEW LOG ===');
 
-        debugPrint(
-          'Growth update = SKIPPED',
-        );
+        debugPrint('Growth update = SKIPPED');
 
-        debugPrint(
-          'Checkpoint = SKIPPED',
-        );
+        debugPrint('Checkpoint = SKIPPED');
 
-        debugPrint(
-          'Interaction = SKIPPED',
-        );
+        debugPrint('Interaction = SKIPPED');
 
-        debugPrint(
-          '================================',
-        );
+        debugPrint('================================');
       }
 
       return;
@@ -1007,19 +908,15 @@ class _TagFolderScreenState
 
     if (mounted) {
       setState(() {
-        processStatus =
-            '[2] LOG識別情報作成中';
+        processStatus = '[2] LOG識別情報作成中';
       });
     }
 
-    final importHash =
-        await ImportService
-            .createImportHash(
-      newLogFiles,
-    );
+    final importHash = await ImportService.createImportHash(newLogFiles);
 
-    currentImportHash =
-        importHash;
+    _throwIfProcessingCancelled(processingGeneration);
+
+    currentImportHash = importHash;
 
     // ==========================================================
     // 3. DUPLICATE
@@ -1027,21 +924,16 @@ class _TagFolderScreenState
 
     if (mounted) {
       setState(() {
-        processStatus =
-            '[3] 二重処理確認中';
+        processStatus = '[3] 二重処理確認中';
       });
     }
 
-    final processed =
-        await DatabaseService.instance
-            .isImportProcessed(
+    final processed = await DatabaseService.instance.isImportProcessed(
       importHash,
     );
 
     if (cfg.debugLogging) {
-      debugPrint(
-        '[3] processed = $processed',
-      );
+      debugPrint('[3] processed = $processed');
     }
 
     // ==========================================================
@@ -1049,9 +941,7 @@ class _TagFolderScreenState
     // ==========================================================
 
     if (processed) {
-      final verified =
-          await DatabaseService.instance
-              .isImportProcessed(
+      final verified = await DatabaseService.instance.isImportProcessed(
         importHash,
       );
 
@@ -1063,41 +953,28 @@ class _TagFolderScreenState
         );
       }
 
-      final seeds =
-          await DatabaseService.instance
-              .getSeeds(
+      final seeds = await DatabaseService.instance.getSeeds(
         result.userInfo.userId,
       );
 
-      final currentFlowers =
-          await DatabaseService.instance.getActiveFlowersByType(
+      final currentFlowers = await DatabaseService.instance
+          .getActiveFlowersByType(result.userInfo.userId);
+      final currentBloomCounts = await DatabaseService.instance.getBloomCounts(
         result.userInfo.userId,
       );
-      final currentBloomCounts =
-          await DatabaseService.instance.getBloomCounts(
-        result.userInfo.userId,
-      );
-      final currentUnusedSeedCounts =
-          await DatabaseService.instance.getUnusedSeedCounts(
-        result.userInfo.userId,
-      );
+      final currentUnusedSeedCounts = await DatabaseService.instance
+          .getUnusedSeedCounts(result.userInfo.userId);
 
       int deleted = 0;
 
-      if (cfg.deleteLogsAfterSuccess &&
-          cfg.deleteProcessedLogs) {
+      if (cfg.deleteLogsAfterSuccess && cfg.deleteProcessedLogs) {
         if (mounted) {
           setState(() {
-            processStatus =
-                '[10] 処理済みLOG削除中';
+            processStatus = '[10] 処理済みLOG削除中';
           });
         }
 
-        deleted =
-            await TagFolderService
-                .deleteLogFiles(
-          result.logFiles,
-        );
+        deleted = await TagFolderService.deleteLogFiles(result.logFiles);
       }
 
       if (!mounted) {
@@ -1105,11 +982,9 @@ class _TagFolderScreenState
       }
 
       setState(() {
-        tagResult =
-            result;
+        tagResult = result;
 
-        seedInventory =
-            seeds;
+        seedInventory = seeds;
 
         activeFlowersByType = currentFlowers;
         resultDisplayStages = {
@@ -1120,20 +995,15 @@ class _TagFolderScreenState
         bloomCounts = currentBloomCounts;
         unusedSeedCounts = currentUnusedSeedCounts;
 
-        alreadyImported =
-            true;
+        alreadyImported = true;
 
-        deletedLogCount =
-            deleted;
+        deletedLogCount = deleted;
 
-        processStatus =
-            (cfg.deleteLogsAfterSuccess &&
-                    cfg.deleteProcessedLogs)
-                ? '処理済みLOG削除完了'
-                : '処理済みデータ';
+        processStatus = (cfg.deleteLogsAfterSuccess && cfg.deleteProcessedLogs)
+            ? '処理済みLOG削除完了'
+            : '処理済みデータ';
 
-        isLoading =
-            false;
+        isLoading = false;
       });
 
       return;
@@ -1151,42 +1021,31 @@ class _TagFolderScreenState
 
     if (mounted) {
       setState(() {
-        processStatus =
-            '[5] チェックポイント判定中';
+        processStatus = '[5] チェックポイント判定中';
       });
     }
 
-    final rawCheckpointHits =
-        CheckpointService.detect(
-      records:
-          allRecords,
+    final rawCheckpointHits = CheckpointService.detect(
+      records: allRecords,
 
-      checkpoints:
-          checkpoints,
+      checkpoints: checkpoints,
 
-      scanGroupSeconds:
-          cfg.scanGroupSeconds,
+      scanGroupSeconds: cfg.scanGroupSeconds,
     );
 
     // ----------------------------------------------------------
     // 1接続につき各Checkpoint 1回
     // ----------------------------------------------------------
 
-    final uniqueCheckpointHits =
-        <CheckpointHit>[];
+    final uniqueCheckpointHits = <CheckpointHit>[];
 
-    final seenCheckpointIds =
-        <String>{};
+    final seenCheckpointIds = <String>{};
 
-    for (final hit
-        in rawCheckpointHits) {
-      final id =
-          hit.checkpoint.id;
+    for (final hit in rawCheckpointHits) {
+      final id = hit.checkpoint.id;
 
       if (seenCheckpointIds.add(id)) {
-        uniqueCheckpointHits.add(
-          hit,
-        );
+        uniqueCheckpointHits.add(hit);
       }
     }
 
@@ -1196,43 +1055,31 @@ class _TagFolderScreenState
 
     if (mounted) {
       setState(() {
-        processStatus =
-            '[6] 交流判定中';
+        processStatus = '[6] 交流判定中';
       });
     }
 
-    final rawInteractions =
-        InteractionService.detect(
-      detectedAddresses:
-          newUniqueAddresses,
+    final rawInteractions = InteractionService.detect(
+      detectedAddresses: newUniqueAddresses,
 
-      users:
-          registeredUsers,
+      users: registeredUsers,
 
-      ownTagMac:
-          result.userInfo
-              .macAddress,
+      ownTagMac: result.userInfo.macAddress,
     );
 
     // ----------------------------------------------------------
     // 1接続につき各ユーザー 1回
     // ----------------------------------------------------------
 
-    final uniqueInteractions =
-        <InteractionHit>[];
+    final uniqueInteractions = <InteractionHit>[];
 
-    final seenUserIds =
-        <String>{};
+    final seenUserIds = <String>{};
 
-    for (final hit
-        in rawInteractions) {
-      final id =
-          hit.user.userId;
+    for (final hit in rawInteractions) {
+      final id = hit.user.userId;
 
       if (seenUserIds.add(id)) {
-        uniqueInteractions.add(
-          hit,
-        );
+        uniqueInteractions.add(hit);
       }
     }
 
@@ -1245,251 +1092,215 @@ class _TagFolderScreenState
 
     if (mounted) {
       setState(() {
-        processStatus =
-            '[7] 種・ユーザー保存中';
+        processStatus = '[7] 種・ユーザー保存中';
       });
     }
 
-    await _saveUserAndSeeds(
-      result:
-          result,
-
-      importHash:
-          importHash,
-
-      checkpointHits:
-          uniqueCheckpointHits,
-
-      interactionHits:
-          uniqueInteractions,
-    );
-
-    // ==========================================================
-    // 8. FLOWER GROWTH
-    // ==========================================================
-
-    if (mounted) {
-      setState(() {
-        processStatus =
-            '[8] 花の成長判定中';
-      });
-    }
-
-    lastStageDelta =
-        GrowthService.calculateStage(
-      value:
-          growthValue,
-      config:
-          cfg,
-    );
-
-    final flowerResult =
-        await _processFlowerGrowth(
-      userId: result.userInfo.userId,
-      growthValue: growthValue,
-      importHash: importHash,
-      checkpointHits: uniqueCheckpointHits,
-      interactionHits: uniqueInteractions,
-    );
-
-    // ==========================================================
-    // 9. IMPORT HISTORY
-    // ==========================================================
-
-    if (mounted) {
-      setState(() {
-        processStatus =
-            '[9] 読込履歴保存中';
-      });
-    }
-
-    await DatabaseService.instance
-        .addImportHistory(
-      userId:
-          result.userInfo.userId,
-
-      importHash:
-          importHash,
-
-      growthMetric:
-          cfg.growthMetric,
-
-      growthValue:
-          growthValue,
-
-      recordCount:
-          newRecordCount,
-
-      uniqueAddressCount:
-          newUniqueAddresses.length,
-
-      status:
-          'completed',
-    );
-
-    // ==========================================================
-    // 10. VERIFY
-    // ==========================================================
-
-    final dbUser =
-        await DatabaseService.instance
-            .getUser(
-      result.userInfo.userId,
-    );
-
-    if (dbUser == null) {
-      throw Exception(
-        'SQLite保存確認失敗。\n'
-        'ユーザー情報がありません。\n'
-        'LOGは削除しません。',
-      );
-    }
-
-    final importVerified =
-        await DatabaseService.instance
-            .isImportProcessed(
-      importHash,
-    );
-
-    if (!importVerified) {
-      throw Exception(
-        'ImportHistoryの'
-        '保存確認に失敗しました。\n'
-        'LOGは削除しません。',
-      );
-    }
-
-    final seeds =
-        await DatabaseService.instance
-            .getSeeds(
-      result.userInfo.userId,
-    );
-
-    // ==========================================================
-    // v5: 新規LOGをarchiveへ保存
-    //
-    // 既存の全処理とDB保存確認が成功した後に行う。
-    // ここまで到達したLOGだけを「処理済みLOG」として保存する。
-    // ==========================================================
-
+    late FlowerProcessResult flowerResult;
+    late List<Map<String, Object?>> seeds;
     int? archiveBatchId;
 
-    if (newLogFiles.isNotEmpty) {
-      archiveBatchId =
-          await DatabaseService.instance
-              .createImportBatch(
-        userId:
-            result.userInfo.userId,
-        batchHash:
-            importHash,
-        growthMetric:
-            cfg.growthMetric,
+    // ==========================================================
+    // ATOMIC DB TRANSACTION
+    //
+    // 種追加・花成長・ImportHistory・LOG archive・Batch完了を
+    // 1つのSQLite Transactionにまとめる。
+    // 途中抜線、例外、PC側処理失敗が起きた場合はROLLBACKされる。
+    // LOGファイル削除だけはCOMMIT後に行う。
+    // ==========================================================
+
+    await DatabaseService.instance.runInTransaction(() async {
+      _throwIfProcessingCancelled(processingGeneration);
+      await _saveUserAndSeeds(
+        result: result,
+
+        importHash: importHash,
+
+        checkpointHits: uniqueCheckpointHits,
+
+        interactionHits: uniqueInteractions,
+        processingGeneration: processingGeneration,
       );
 
-      for (final logFile
-          in newLogFiles) {
-        final fileHash =
-            await TagFolderService
-                .calculateLogHash(
-          logFile,
+      // ==========================================================
+      // 8. FLOWER GROWTH
+      // ==========================================================
+
+      if (mounted) {
+        setState(() {
+          processStatus = '[8] 花の成長判定中';
+        });
+      }
+
+      lastStageDelta = GrowthService.calculateStage(
+        value: growthValue,
+        config: cfg,
+      );
+
+      flowerResult = await _processFlowerGrowth(
+        userId: result.userInfo.userId,
+        growthValue: growthValue,
+        importHash: importHash,
+        checkpointHits: uniqueCheckpointHits,
+        interactionHits: uniqueInteractions,
+        processingGeneration: processingGeneration,
+      );
+
+      // ==========================================================
+      // 9. IMPORT HISTORY
+      // ==========================================================
+
+      if (mounted) {
+        setState(() {
+          processStatus = '[9] 読込履歴保存中';
+        });
+      }
+
+      await DatabaseService.instance.addImportHistory(
+        userId: result.userInfo.userId,
+
+        importHash: importHash,
+
+        growthMetric: cfg.growthMetric,
+
+        growthValue: growthValue,
+
+        recordCount: newRecordCount,
+
+        uniqueAddressCount: newUniqueAddresses.length,
+
+        status: 'completed',
+      );
+
+      // ==========================================================
+      // 10. VERIFY
+      // ==========================================================
+
+      final dbUser = await DatabaseService.instance.getUser(
+        result.userInfo.userId,
+      );
+
+      if (dbUser == null) {
+        throw Exception(
+          'SQLite保存確認失敗。\n'
+          'ユーザー情報がありません。\n'
+          'LOGは削除しません。',
+        );
+      }
+
+      final importVerified = await DatabaseService.instance.isImportProcessed(
+        importHash,
+      );
+
+      if (!importVerified) {
+        throw Exception(
+          'ImportHistoryの'
+          '保存確認に失敗しました。\n'
+          'LOGは削除しません。',
+        );
+      }
+
+      seeds = await DatabaseService.instance.getSeeds(result.userInfo.userId);
+
+      // ==========================================================
+      // v5: 新規LOGをarchiveへ保存
+      //
+      // 既存の全処理とDB保存確認が成功した後に行う。
+      // ここまで到達したLOGだけを「処理済みLOG」として保存する。
+      // ==========================================================
+
+      archiveBatchId = null;
+
+      if (newLogFiles.isNotEmpty) {
+        final createdBatchId = await DatabaseService.instance.createImportBatch(
+          userId: result.userInfo.userId,
+          batchHash: importHash,
+          growthMetric: cfg.growthMetric,
         );
 
-        final rawContent =
-            await logFile.readAsString();
+        archiveBatchId = createdBatchId;
 
-        // result.logFiles と result.logResults は
-        // 同じ順番で作成されているので対応付ける
-        final index =
-            result.logFiles.indexWhere(
-          (file) =>
-              file.path == logFile.path,
-        );
+        // 高速化:
+        // result.logFiles と result.logResults の対応を最初にMap化する。
+        // これにより各LOGごとの indexWhere を廃止する。
+        final recordCountByPath = <String, int>{};
 
-        if (index < 0 ||
-            index >= result.logResults.length) {
-          throw Exception(
-            'LOG解析結果との対応付けに'
-            '失敗しました。\n'
-            '${logFile.path}',
+        for (int i = 0; i < result.logFiles.length; i++) {
+          recordCountByPath[result.logFiles[i].path] =
+              result.logResults[i].records.length;
+        }
+
+        for (final logFile in newLogFiles) {
+          final fileHash = logHashByPath[logFile.path];
+          final recordCount = recordCountByPath[logFile.path];
+
+          if (fileHash == null) {
+            throw Exception(
+              'LOGハッシュのキャッシュが見つかりません。\n'
+              '${logFile.path}',
+            );
+          }
+
+          if (recordCount == null) {
+            throw Exception(
+              'LOG解析結果との対応付けに失敗しました。\n'
+              '${logFile.path}',
+            );
+          }
+
+          // 生LOG本文はSQLiteへ保存しない。
+          // 二重処理判定に必要な file_hash / file_name / record_count のみ保存。
+          await DatabaseService.instance.archiveLog(
+            userId: result.userInfo.userId,
+            batchId: archiveBatchId,
+            fileName: logFile.uri.pathSegments.last,
+            fileHash: fileHash,
+            rawContent: null,
+            recordCount: recordCount,
           );
         }
 
-        final recordCount =
-            result
-                .logResults[index]
-                .records
-                .length;
+        // -----------------------------------------------
+        // このBatch内のLOGを処理済みにする
+        // -----------------------------------------------
 
-        await DatabaseService.instance
-            .archiveLog(
-          userId:
-              result.userInfo.userId,
-          batchId:
-              archiveBatchId,
-          fileName:
-              logFile.uri.pathSegments.last,
-          fileHash:
-              fileHash,
-          rawContent:
-              rawContent,
-          recordCount:
-              recordCount,
+        await DatabaseService.instance.markBatchLogsProcessed(createdBatchId);
+
+        // -----------------------------------------------
+        // Batch自体もcompletedにする
+        // -----------------------------------------------
+
+        await DatabaseService.instance.completeImportBatch(
+          batchId: createdBatchId,
+          growthValue: growthValue,
+          recordCount: newRecordCount,
+
+          uniqueAddressCount: newUniqueAddresses.length,
+          checkpointCount: uniqueCheckpointHits.length,
+          interactionCount: uniqueInteractions.length,
         );
+
+        if (cfg.debugLogging) {
+          debugPrint('================================');
+
+          debugPrint('=== LOG ARCHIVE SUCCESS ===');
+
+          debugPrint('Batch ID = $createdBatchId');
+
+          debugPrint(
+            'Archived LOG = '
+            '${newLogFiles.length}',
+          );
+
+          debugPrint('================================');
+        }
       }
 
-      // -----------------------------------------------
-      // このBatch内のLOGを処理済みにする
-      // -----------------------------------------------
+      _throwIfProcessingCancelled(processingGeneration);
+    });
 
-      await DatabaseService.instance
-          .markBatchLogsProcessed(
-        archiveBatchId,
-      );
-
-      // -----------------------------------------------
-      // Batch自体もcompletedにする
-      // -----------------------------------------------
-
-      await DatabaseService.instance
-          .completeImportBatch(
-        batchId:
-            archiveBatchId,
-        growthValue:
-            growthValue,
-        recordCount:
-            newRecordCount,
-
-        uniqueAddressCount:
-            newUniqueAddresses.length,
-        checkpointCount:
-            uniqueCheckpointHits.length,
-        interactionCount:
-            uniqueInteractions.length,
-      );
-
-      if (cfg.debugLogging) {
-        debugPrint(
-          '================================',
-        );
-
-        debugPrint(
-          '=== LOG ARCHIVE SUCCESS ===',
-        );
-
-        debugPrint(
-          'Batch ID = $archiveBatchId',
-        );
-
-        debugPrint(
-          'Archived LOG = '
-          '${newLogFiles.length}',
-        );
-
-        debugPrint(
-          '================================',
-        );
-      }
-    }
+    // ここへ到達した時点で、今回のDB更新はCOMMIT済み。
+    _throwIfProcessingCancelled(processingGeneration);
 
     // ==========================================================
     // 11. LOG DELETE
@@ -1500,16 +1311,13 @@ class _TagFolderScreenState
     if (cfg.deleteLogsAfterSuccess) {
       if (mounted) {
         setState(() {
-          processStatus =
-              '[11] LOG削除中';
+          processStatus = '[11] LOG削除中';
         });
       }
 
-      deleted =
-          await TagFolderService
-              .deleteLogFiles(
-        result.logFiles,
-      );
+      deleted = await TagFolderService.deleteLogFiles(result.logFiles);
+
+      _throwIfProcessingCancelled(processingGeneration);
     }
 
     if (!mounted) {
@@ -1517,17 +1325,13 @@ class _TagFolderScreenState
     }
 
     setState(() {
-      tagResult =
-          result;
+      tagResult = result;
 
-      checkpointHits =
-          uniqueCheckpointHits;
+      checkpointHits = uniqueCheckpointHits;
 
-      interactionHits =
-          uniqueInteractions;
+      interactionHits = uniqueInteractions;
 
-      seedInventory =
-          seeds;
+      seedInventory = seeds;
 
       activeFlowersByType = flowerResult.activeFlowers;
       resultDisplayStages = flowerResult.displayStages;
@@ -1535,46 +1339,30 @@ class _TagFolderScreenState
       bloomCounts = flowerResult.bloomCounts;
       unusedSeedCounts = flowerResult.unusedSeedCounts;
 
-      alreadyImported =
-          false;
+      alreadyImported = false;
 
-      deletedLogCount =
-          deleted;
+      deletedLogCount = deleted;
 
-      processStatus =
-          cfg.deleteLogsAfterSuccess
-              ? '保存・LOG削除完了'
-              : '保存完了';
+      processStatus = cfg.deleteLogsAfterSuccess ? '保存・LOG削除完了' : '保存完了';
 
-      isLoading =
-          false;
+      isLoading = false;
     });
 
     if (cfg.debugLogging) {
-      debugPrint(
-        '================================',
-      );
+      debugPrint('================================');
 
-      debugPrint(
-        '=== ALL PROCESS SUCCESS ===',
-      );
+      debugPrint('=== ALL PROCESS SUCCESS ===');
 
-      debugPrint(
-        'Growth value = $growthValue',
-      );
+      debugPrint('Growth value = $growthValue');
 
       debugPrint('Result display stages = $resultDisplayStages');
       debugPrint('Stage deltas = $resultStageDeltas');
       debugPrint('Bloom counts = $bloomCounts');
       debugPrint('Unused seed counts = $unusedSeedCounts');
 
-      debugPrint(
-        'Deleted LOG = $deleted',
-      );
+      debugPrint('Deleted LOG = $deleted');
 
-      debugPrint(
-        '================================',
-      );
+      debugPrint('================================');
     }
   }
 
@@ -1585,24 +1373,19 @@ class _TagFolderScreenState
   Future<void> _saveUserAndSeeds({
     required TagFolderResult result,
     required String importHash,
-    required List<CheckpointHit>
-        checkpointHits,
-    required List<InteractionHit>
-        interactionHits,
+    required List<CheckpointHit> checkpointHits,
+    required List<InteractionHit> interactionHits,
+    int? processingGeneration,
   }) async {
-    final userId =
-        result.userInfo.userId;
-
-
+    final userId = result.userInfo.userId;
 
     // ==========================================================
     // CHECKPOINT FIRST
     // ==========================================================
 
-    for (final hit
-        in checkpointHits) {
-      final flower =
-          hit.checkpoint.flower;
+    for (final hit in checkpointHits) {
+      _throwIfProcessingCancelled(processingGeneration);
+      final flower = hit.checkpoint.flower;
 
       /*
        * importHashをsourceIdへ含めることで、
@@ -1620,21 +1403,17 @@ class _TagFolderScreenState
           '${hit.checkpoint.id}:'
           '$importHash';
 
-      final added =
-          await DatabaseService.instance
-              .addSeed(
-        userId:
-            userId,
+      final added = await DatabaseService.instance.addSeed(
+        userId: userId,
 
-        flowerId:
-            flower,
+        flowerId: flower,
 
-        sourceType:
-            'checkpoint',
+        sourceType: 'checkpoint',
 
-        sourceId:
-            sourceId,
+        sourceId: sourceId,
       );
+
+      _throwIfProcessingCancelled(processingGeneration);
 
       if (added) {
         newlyAddedSeeds.add(
@@ -1648,30 +1427,25 @@ class _TagFolderScreenState
     // INTERACTION SECOND
     // ==========================================================
 
-    for (final hit
-        in interactionHits) {
-      final flower =
-          hit.user.flower;
+    for (final hit in interactionHits) {
+      _throwIfProcessingCancelled(processingGeneration);
+      final flower = hit.user.flower;
 
       final sourceId =
           '${hit.user.userId}:'
           '$importHash';
 
-      final added =
-          await DatabaseService.instance
-              .addSeed(
-        userId:
-            userId,
+      final added = await DatabaseService.instance.addSeed(
+        userId: userId,
 
-        flowerId:
-            flower,
+        flowerId: flower,
 
-        sourceType:
-            'interaction',
+        sourceType: 'interaction',
 
-        sourceId:
-            sourceId,
+        sourceId: sourceId,
       );
+
+      _throwIfProcessingCancelled(processingGeneration);
 
       if (added) {
         newlyAddedSeeds.add(
@@ -1699,185 +1473,136 @@ class _TagFolderScreenState
     required String importHash,
     required List<CheckpointHit> checkpointHits,
     required List<InteractionHit> interactionHits,
+    int? processingGeneration,
   }) async {
     if (config == null) {
       throw Exception('Configがありません。');
     }
 
-    final stageDelta =
-        GrowthService.calculateStage(
+    _throwIfProcessingCancelled(processingGeneration);
+
+    final stageDelta = GrowthService.calculateStage(
       value: growthValue,
       config: config!,
     );
 
-    final targetFlowerIds =
-        <String>{};
+    final targetFlowerIds = <String>{};
 
     for (final hit in checkpointHits) {
-      final flowerId =
-          hit.checkpoint.flower.trim();
+      final flowerId = hit.checkpoint.flower.trim();
 
-      if (flowerMaxStages.containsKey(
-        flowerId,
-      )) {
-        targetFlowerIds.add(
-          flowerId,
-        );
+      if (flowerMaxStages.containsKey(flowerId)) {
+        targetFlowerIds.add(flowerId);
       }
     }
 
     for (final hit in interactionHits) {
-      final flowerId =
-          hit.user.flower.trim();
+      final flowerId = hit.user.flower.trim();
 
-      if (flowerMaxStages.containsKey(
-        flowerId,
-      )) {
-        targetFlowerIds.add(
-          flowerId,
-        );
+      if (flowerMaxStages.containsKey(flowerId)) {
+        targetFlowerIds.add(flowerId);
       }
     }
 
     if (targetFlowerIds.isEmpty) {
-      targetFlowerIds.add(
-        'cosmos',
-      );
+      targetFlowerIds.add('cosmos');
 
-      await DatabaseService.instance
-          .addSeed(
+      await DatabaseService.instance.addSeed(
         userId: userId,
         flowerId: 'cosmos',
         sourceType: 'activity',
         sourceId: 'cosmos:$importHash',
       );
+
+      _throwIfProcessingCancelled(processingGeneration);
     }
 
-    final displayStages =
-        <String, int>{};
+    final displayStages = <String, int>{};
 
-    final stageDeltas =
-        <String, int>{};
+    final stageDeltas = <String, int>{};
 
-    final beforeActive =
-        await DatabaseService.instance
-            .getActiveFlowersByType(
+    final beforeActive = await DatabaseService.instance.getActiveFlowersByType(
       userId,
     );
 
-    for (final entry
-        in beforeActive.entries) {
-      displayStages[entry.key] =
-          (entry.value['stage']
-                      as num?)
-                  ?.toInt() ??
-              0;
+    _throwIfProcessingCancelled(processingGeneration);
+
+    for (final entry in beforeActive.entries) {
+      displayStages[entry.key] = (entry.value['stage'] as num?)?.toInt() ?? 0;
     }
 
-    for (final flowerId
-        in targetFlowerIds) {
-      final maxStage =
-          flowerMaxStages[flowerId]!;
+    for (final flowerId in targetFlowerIds) {
+      _throwIfProcessingCancelled(processingGeneration);
+      final maxStage = flowerMaxStages[flowerId]!;
 
-      stageDeltas[flowerId] =
-          stageDelta;
+      stageDeltas[flowerId] = stageDelta;
 
-      var remainingStages =
-          stageDelta;
+      var remainingStages = stageDelta;
 
-      var remainingGrowthValue =
-          growthValue;
+      var remainingGrowthValue = growthValue;
 
-      var current =
-          await DatabaseService.instance
-              .getActiveFlowerByType(
+      var current = await DatabaseService.instance.getActiveFlowerByType(
         userId: userId,
         flowerId: flowerId,
       );
 
+      _throwIfProcessingCancelled(processingGeneration);
+
       if (remainingStages <= 0) {
-        displayStages[flowerId] =
-            (current?['stage']
-                        as num?)
-                    ?.toInt() ??
-                0;
+        displayStages[flowerId] = (current?['stage'] as num?)?.toInt() ?? 0;
         continue;
       }
 
-      current ??=
-          await DatabaseService.instance
-              .activateNextSeedForFlower(
+      current ??= await DatabaseService.instance.activateNextSeedForFlower(
         userId: userId,
         flowerId: flowerId,
         initialStage: 0,
         initialGrowthValue: 0,
       );
 
+      _throwIfProcessingCancelled(processingGeneration);
+
       if (current == null) {
-        displayStages.putIfAbsent(
-          flowerId,
-          () => 0,
-        );
+        displayStages.putIfAbsent(flowerId, () => 0);
         continue;
       }
 
-      bool bloomedThisConnection =
-          false;
+      bool bloomedThisConnection = false;
 
-      final totalStageDelta =
-          stageDelta;
+      final totalStageDelta = stageDelta;
 
-      while (remainingStages > 0 &&
-          current != null) {
-        final userFlowerId =
-            (current['id'] as num)
-                .toInt();
+      while (remainingStages > 0 && current != null) {
+        _throwIfProcessingCancelled(processingGeneration);
+        final userFlowerId = (current['id'] as num).toInt();
 
-        final currentStage =
-            (current['stage']
-                        as num?)
-                    ?.toInt() ??
-                0;
+        final currentStage = (current['stage'] as num?)?.toInt() ?? 0;
 
         final currentGrowthValue =
-            (current['growth_value']
-                        as num?)
-                    ?.toInt() ??
-                0;
+            (current['growth_value'] as num?)?.toInt() ?? 0;
 
-        final stagesToBloom =
-            maxStage -
-                currentStage;
+        final stagesToBloom = maxStage - currentStage;
 
         if (stagesToBloom <= 0) {
-          await DatabaseService.instance
-              .markFlowerBloomed(
-            userFlowerId:
-                userFlowerId,
-            growthValue:
-                currentGrowthValue,
-            maxStage:
-                maxStage,
+          await DatabaseService.instance.markFlowerBloomed(
+            userFlowerId: userFlowerId,
+            growthValue: currentGrowthValue,
+            maxStage: maxStage,
           );
 
-          bloomedThisConnection =
-              true;
+          _throwIfProcessingCancelled(processingGeneration);
 
-          displayStages[flowerId] =
-              maxStage;
+          bloomedThisConnection = true;
 
-          current =
-              await DatabaseService.instance
-                  .activateNextSeedForFlower(
-            userId:
-                userId,
-            flowerId:
-                flowerId,
-            initialStage:
-                0,
-            initialGrowthValue:
-                0,
+          displayStages[flowerId] = maxStage;
+
+          current = await DatabaseService.instance.activateNextSeedForFlower(
+            userId: userId,
+            flowerId: flowerId,
+            initialStage: 0,
+            initialGrowthValue: 0,
           );
+
+          _throwIfProcessingCancelled(processingGeneration);
 
           if (current == null) {
             remainingStages = 0;
@@ -1887,71 +1612,50 @@ class _TagFolderScreenState
           continue;
         }
 
-        final stagesAppliedToCurrent =
-            remainingStages <
-                    stagesToBloom
-                ? remainingStages
-                : stagesToBloom;
+        final stagesAppliedToCurrent = remainingStages < stagesToBloom
+            ? remainingStages
+            : stagesToBloom;
 
         final int growthAppliedToCurrent;
 
-        if (stagesAppliedToCurrent ==
-                remainingStages ||
-            totalStageDelta <= 0) {
-          growthAppliedToCurrent =
-              remainingGrowthValue;
+        if (stagesAppliedToCurrent == remainingStages || totalStageDelta <= 0) {
+          growthAppliedToCurrent = remainingGrowthValue;
         } else {
           final proportional =
-              (growthValue *
-                      stagesAppliedToCurrent /
-                      totalStageDelta)
-                  .round();
+              (growthValue * stagesAppliedToCurrent / totalStageDelta).round();
 
-          growthAppliedToCurrent =
-              proportional
-                  .clamp(
-                    0,
-                    remainingGrowthValue,
-                  )
-                  .toInt();
+          growthAppliedToCurrent = proportional
+              .clamp(0, remainingGrowthValue)
+              .toInt();
         }
 
-        final newGrowthValue =
-            currentGrowthValue +
-                growthAppliedToCurrent;
+        final newGrowthValue = currentGrowthValue + growthAppliedToCurrent;
 
-        final newStage =
-            currentStage +
-                stagesAppliedToCurrent;
+        final newStage = currentStage + stagesAppliedToCurrent;
 
-        remainingStages -=
-            stagesAppliedToCurrent;
+        remainingStages -= stagesAppliedToCurrent;
 
-        remainingGrowthValue -=
-            growthAppliedToCurrent;
+        remainingGrowthValue -= growthAppliedToCurrent;
 
         if (newStage < maxStage) {
-          await DatabaseService.instance
-              .updateFlowerGrowth(
-            userFlowerId:
-                userFlowerId,
-            growthValue:
-                newGrowthValue,
-            stage:
-                newStage,
+          await DatabaseService.instance.updateFlowerGrowth(
+            userFlowerId: userFlowerId,
+            growthValue: newGrowthValue,
+            stage: newStage,
           );
 
+          _throwIfProcessingCancelled(processingGeneration);
+
           if (!bloomedThisConnection) {
-            displayStages[flowerId] =
-                newStage;
+            displayStages[flowerId] = newStage;
           }
 
           if (remainingStages > 0) {
-            current =
-                await DatabaseService.instance
-                    .getFlowerById(
+            current = await DatabaseService.instance.getFlowerById(
               userFlowerId,
             );
+
+            _throwIfProcessingCancelled(processingGeneration);
           } else {
             current = null;
           }
@@ -1959,35 +1663,27 @@ class _TagFolderScreenState
           continue;
         }
 
-        await DatabaseService.instance
-            .markFlowerBloomed(
-          userFlowerId:
-              userFlowerId,
-          growthValue:
-              newGrowthValue,
-          maxStage:
-              maxStage,
+        await DatabaseService.instance.markFlowerBloomed(
+          userFlowerId: userFlowerId,
+          growthValue: newGrowthValue,
+          maxStage: maxStage,
         );
 
-        bloomedThisConnection =
-            true;
+        _throwIfProcessingCancelled(processingGeneration);
 
-        displayStages[flowerId] =
-            maxStage;
+        bloomedThisConnection = true;
+
+        displayStages[flowerId] = maxStage;
 
         if (remainingStages > 0) {
-          current =
-              await DatabaseService.instance
-                  .activateNextSeedForFlower(
-            userId:
-                userId,
-            flowerId:
-                flowerId,
-            initialStage:
-                0,
-            initialGrowthValue:
-                0,
+          current = await DatabaseService.instance.activateNextSeedForFlower(
+            userId: userId,
+            flowerId: flowerId,
+            initialStage: 0,
+            initialGrowthValue: 0,
           );
+
+          _throwIfProcessingCancelled(processingGeneration);
 
           if (current == null) {
             remainingStages = 0;
@@ -1999,80 +1695,49 @@ class _TagFolderScreenState
       }
     }
 
-    final activeFlowers =
-        await DatabaseService.instance
-            .getActiveFlowersByType(
+    final activeFlowers = await DatabaseService.instance.getActiveFlowersByType(
       userId,
     );
 
-    final currentBloomCounts =
-        await DatabaseService.instance
-            .getBloomCounts(
+    _throwIfProcessingCancelled(processingGeneration);
+
+    final currentBloomCounts = await DatabaseService.instance.getBloomCounts(
       userId,
     );
 
-    final currentUnusedSeedCounts =
-        await DatabaseService.instance
-            .getUnusedSeedCounts(
-      userId,
-    );
+    _throwIfProcessingCancelled(processingGeneration);
 
-    for (final entry
-        in activeFlowers.entries) {
+    final currentUnusedSeedCounts = await DatabaseService.instance
+        .getUnusedSeedCounts(userId);
+
+    _throwIfProcessingCancelled(processingGeneration);
+
+    for (final entry in activeFlowers.entries) {
       displayStages.putIfAbsent(
         entry.key,
-        () =>
-            (entry.value['stage']
-                        as num?)
-                    ?.toInt() ??
-                0,
+        () => (entry.value['stage'] as num?)?.toInt() ?? 0,
       );
     }
 
     if (config!.debugLogging) {
-      debugPrint(
-        '================================',
-      );
-      debugPrint(
-        '=== MULTI FLOWER GROWTH ===',
-      );
-      debugPrint(
-        'Growth value = $growthValue',
-      );
-      debugPrint(
-        'Stage delta = $stageDelta',
-      );
-      debugPrint(
-        'Targets = $targetFlowerIds',
-      );
-      debugPrint(
-        'Display stages = $displayStages',
-      );
-      debugPrint(
-        'Active flowers = ${activeFlowers.keys.toList()}',
-      );
-      debugPrint(
-        'Bloom counts = $currentBloomCounts',
-      );
-      debugPrint(
-        'Unused seeds = $currentUnusedSeedCounts',
-      );
-      debugPrint(
-        '================================',
-      );
+      debugPrint('================================');
+      debugPrint('=== MULTI FLOWER GROWTH ===');
+      debugPrint('Growth value = $growthValue');
+      debugPrint('Stage delta = $stageDelta');
+      debugPrint('Targets = $targetFlowerIds');
+      debugPrint('Display stages = $displayStages');
+      debugPrint('Active flowers = ${activeFlowers.keys.toList()}');
+      debugPrint('Bloom counts = $currentBloomCounts');
+      debugPrint('Unused seeds = $currentUnusedSeedCounts');
+      debugPrint('================================');
     }
 
     return FlowerProcessResult(
-      activeFlowers:
-          activeFlowers,
-      displayStages:
-          displayStages,
-      stageDeltas:
-          stageDeltas,
-      bloomCounts:
-          currentBloomCounts,
-      unusedSeedCounts:
-          currentUnusedSeedCounts,
+      activeFlowers: activeFlowers,
+      displayStages: displayStages,
+      stageDeltas: stageDeltas,
+      bloomCounts: currentBloomCounts,
+      unusedSeedCounts: currentUnusedSeedCounts,
     );
   }
 
@@ -2094,106 +1759,20 @@ class _TagFolderScreenState
       signageViewState = SignageViewState.growth;
     });
 
-    // ----------------------------------------------------------
-    // 1) 結果画面を30秒表示
-    // ----------------------------------------------------------
-    _resultDisplayTimer = Timer(
-      const Duration(seconds: 30),
-      () {
-        if (!mounted) {
-          return;
-        }
+    // 結果画面を30秒表示した後、
+    // 「抜いても大丈夫です」画面へ移行する。
+    // その後は時間で待機へ戻さず、物理USB抜線を待つ。
+    _resultDisplayTimer = Timer(const Duration(seconds: 30), () {
+      if (!mounted) {
+        return;
+      }
 
-        setState(() {
-          signageViewState =
-              SignageViewState.complete;
-
-          usbStatus =
-              '抜いても大丈夫です';
-
-          processStatus =
-              '取り外し可能';
-        });
-
-        // ------------------------------------------------------
-        // 2) 「抜いても大丈夫です」を15秒表示
-        // ------------------------------------------------------
-        _returnToWaitingTimer?.cancel();
-
-        _returnToWaitingTimer = Timer(
-          const Duration(seconds: 15),
-          () {
-            if (!mounted) {
-              return;
-            }
-
-            // UIだけ待機へ戻す。
-            //
-            // USB監視側の「同じタグを再処理しない」状態は
-            // ここではリセットしない。
-            // 次に新しいタグが検出されたときだけ処理を開始する。
-            setState(() {
-              signageViewState =
-                  SignageViewState.waiting;
-
-              usbStatus =
-                  'BLEタグを接続してください';
-
-              processStatus =
-                  '待機中';
-
-              errorMessage =
-                  null;
-
-              tagResult =
-                  null;
-
-              checkpointHits =
-                  [];
-
-              interactionHits =
-                  [];
-
-              seedInventory =
-                  [];
-
-              activeFlowersByType =
-                  {};
-
-              resultDisplayStages =
-                  {};
-
-              resultStageDeltas =
-                  {};
-
-              bloomCounts =
-                  {};
-
-              unusedSeedCounts =
-                  {};
-
-              newlyAddedSeeds.clear();
-              alreadyOwnedSeeds.clear();
-
-              alreadyImported =
-                  false;
-
-              currentImportHash =
-                  null;
-
-              deletedLogCount =
-                  0;
-
-              lastStageDelta =
-                  0;
-
-              isLoading =
-                  false;
-            });
-          },
-        );
-      },
-    );
+      setState(() {
+        signageViewState = SignageViewState.complete;
+        usbStatus = '抜いても大丈夫です';
+        processStatus = '物理抜線待ち';
+      });
+    });
   }
 
   // ============================================================
@@ -2220,80 +1799,40 @@ class _TagFolderScreenState
 
   Widget _buildWorldBackground() {
     return LayoutBuilder(
-      builder:
-          (
-        context,
-        constraints,
-      ) {
-        final width =
-            constraints.maxWidth;
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
 
-        final height =
-            constraints.maxHeight;
+        final height = constraints.maxHeight;
 
-        final isPortrait =
-            height > width;
+        final isPortrait = height > width;
 
-        final sunSize =
-            (width *
-                    (isPortrait
-                        ? 0.16
-                        : 0.085))
-                .clamp(
-                  85.0,
-                  145.0,
-                )
-                .toDouble();
+        final sunSize = (width * (isPortrait ? 0.16 : 0.085))
+            .clamp(85.0, 145.0)
+            .toDouble();
 
         return Stack(
           children: [
             // 空
-            const Positioned.fill(
-              child: ColoredBox(
-                color:
-                    Color(
-                  0xFFB9E3F7,
-                ),
-              ),
-            ),
+            const Positioned.fill(child: ColoredBox(color: Color(0xFFB9E3F7))),
 
             // 地面：常に画面下1/3
             Positioned(
-              left:
-                  0,
-              right:
-                  0,
-              bottom:
-                  0,
-              height:
-                  height /
-                      3,
-              child:
-                  const ColoredBox(
-                color:
-                    Color(
-                  0xFFE7D2AD,
-                ),
-              ),
+              left: 0,
+              right: 0,
+              bottom: 0,
+              height: height / 3,
+              child: const ColoredBox(color: Color(0xFFE7D2AD)),
             ),
 
             // 太陽
             Positioned(
-              top:
-                  height *
-                      0.025,
-              right:
-                  width *
-                      0.035,
-              child:
-                  Image.asset(
+              top: height * 0.025,
+              right: width * 0.035,
+              child: Image.asset(
                 'assets/images/sun.png',
-                width:
-                    sunSize,
-                height:
-                    sunSize,
-                fit:
-                    BoxFit.contain,
+                width: sunSize,
+                height: sunSize,
+                fit: BoxFit.contain,
               ),
             ),
           ],
@@ -2329,145 +1868,67 @@ class _TagFolderScreenState
     required bool showProgress,
   }) {
     return LayoutBuilder(
-      builder:
-          (
-        context,
-        constraints,
-      ) {
-        final width =
-            constraints.maxWidth;
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
 
-        final height =
-            constraints.maxHeight;
+        final height = constraints.maxHeight;
 
-        final isPortrait =
-            height > width;
+        final isPortrait = height > width;
 
-        final imageHeight =
-            (height *
-                    (isPortrait
-                        ? 0.16
-                        : 0.17))
-                .clamp(
-                  90.0,
-                  170.0,
-                )
-                .toDouble();
+        final imageHeight = (height * (isPortrait ? 0.16 : 0.17))
+            .clamp(90.0, 170.0)
+            .toDouble();
 
-        final messageFontSize =
-            (width *
-                    (isPortrait
-                        ? 0.060
-                        : 0.028))
-                .clamp(
-                  30.0,
-                  48.0,
-                )
-                .toDouble();
+        final messageFontSize = (width * (isPortrait ? 0.060 : 0.028))
+            .clamp(30.0, 48.0)
+            .toDouble();
 
         return Stack(
           children: [
             Positioned(
-              left:
-                  width *
-                      0.025,
-              right:
-                  width *
-                      0.025,
-              bottom:
-                  height /
-                          3 -
-                      height *
-                          0.018,
-              child:
-                  _buildResponsiveEmptyPotsRow(
-                availableWidth:
-                    width *
-                        0.95,
-                availableHeight:
-                    height,
+              left: width * 0.025,
+              right: width * 0.025,
+              bottom: height / 3 - height * 0.018,
+              child: _buildResponsiveEmptyPotsRow(
+                availableWidth: width * 0.95,
+                availableHeight: height,
               ),
             ),
 
             Positioned.fill(
               child: Center(
-                child:
-                    Transform.translate(
-                  offset:
-                      Offset(
-                    0,
-                    -height *
-                        (isPortrait
-                            ? 0.10
-                            : 0.045),
-                  ),
+                child: Transform.translate(
+                  offset: Offset(0, -height * (isPortrait ? 0.10 : 0.045)),
                   child: Column(
-                    mainAxisSize:
-                        MainAxisSize.min,
+                    mainAxisSize: MainAxisSize.min,
                     children: [
                       Image.asset(
                         handImage,
-                        height:
-                            imageHeight,
-                        fit:
-                            BoxFit.contain,
+                        height: imageHeight,
+                        fit: BoxFit.contain,
                       ),
 
-                      SizedBox(
-                        height:
-                            height *
-                                0.018,
-                      ),
+                      SizedBox(height: height * 0.018),
 
                       Text(
                         message,
-                        textAlign:
-                            TextAlign.center,
-                        style:
-                            TextStyle(
-                          fontSize:
-                              messageFontSize,
-                          fontWeight:
-                              FontWeight.w900,
-                          color:
-                              const Color(
-                            0xFF163B59,
-                          ),
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: messageFontSize,
+                          fontWeight: FontWeight.w900,
+                          color: const Color(0xFF163B59),
                         ),
                       ),
 
                       if (showProgress) ...[
-                        SizedBox(
-                          height:
-                              height *
-                                  0.022,
-                        ),
+                        SizedBox(height: height * 0.022),
 
                         SizedBox(
-                          width:
-                              (width *
-                                      0.06)
-                                  .clamp(
-                                    34.0,
-                                    50.0,
-                                  )
-                                  .toDouble(),
-                          height:
-                              (width *
-                                      0.06)
-                                  .clamp(
-                                    34.0,
-                                    50.0,
-                                  )
-                                  .toDouble(),
-                          child:
-                              const CircularProgressIndicator(
-                            strokeWidth:
-                                5,
-                            color:
-                                Color(
-                              0xFF163B59,
-                            ),
+                          width: (width * 0.06).clamp(34.0, 50.0).toDouble(),
+                          height: (width * 0.06).clamp(34.0, 50.0).toDouble(),
+                          child: const CircularProgressIndicator(
+                            strokeWidth: 5,
+                            color: Color(0xFF163B59),
                           ),
                         ),
                       ],
@@ -2493,96 +1954,55 @@ class _TagFolderScreenState
     required double bloomFontSize,
     required double deltaFontSize,
   }) {
-    final stage =
-        _displayStageFor(
-      flowerId,
-    );
+    final stage = _displayStageFor(flowerId);
 
-    final maxStage =
-        flowerMaxStages[flowerId]!;
+    final maxStage = flowerMaxStages[flowerId]!;
 
-    final safeStage =
-        stage
-            .clamp(
-              0,
-              maxStage,
-            )
-            .toInt();
+    final safeStage = stage.clamp(0, maxStage).toInt();
 
-    final delta =
-        resultStageDeltas[flowerId] ??
-            0;
+    final delta = resultStageDeltas[flowerId] ?? 0;
 
-    final bloomCount =
-        bloomCounts[flowerId] ??
-            0;
+    final bloomCount = bloomCounts[flowerId] ?? 0;
 
     return SizedBox(
-      width:
-          width,
+      width: width,
       child: Column(
-        mainAxisSize:
-            MainAxisSize.min,
+        mainAxisSize: MainAxisSize.min,
         children: [
           // ----------------------------------------------------
           // 累計開花数
           // ----------------------------------------------------
           FittedBox(
-            fit:
-                BoxFit.scaleDown,
+            fit: BoxFit.scaleDown,
             child: Text(
               '開花 $bloomCount 本',
-              textAlign:
-                  TextAlign.center,
-              style:
-                  TextStyle(
-                fontSize:
-                    bloomFontSize,
-                fontWeight:
-                    FontWeight.w900,
-                color:
-                    const Color(
-                  0xFF163B59,
-                ),
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: bloomFontSize,
+                fontWeight: FontWeight.w900,
+                color: const Color(0xFF163B59),
               ),
             ),
           ),
 
-          SizedBox(
-            height:
-                imageHeight *
-                    0.015,
-          ),
+          SizedBox(height: imageHeight * 0.015),
 
           // ----------------------------------------------------
           // 今回の成長Stage
           // ----------------------------------------------------
           Text(
             '+$delta',
-            textAlign:
-                TextAlign.center,
-            style:
-                TextStyle(
-              fontSize:
-                  deltaFontSize,
-              fontWeight:
-                  FontWeight.w900,
-              color:
-                  delta > 0
-                      ? const Color(
-                          0xFFC62828,
-                        )
-                      : const Color(
-                          0xFF1565C0,
-                        ),
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: deltaFontSize,
+              fontWeight: FontWeight.w900,
+              color: delta > 0
+                  ? const Color(0xFFC62828)
+                  : const Color(0xFF1565C0),
             ),
           ),
 
-          SizedBox(
-            height:
-                imageHeight *
-                    0.02,
-          ),
+          SizedBox(height: imageHeight * 0.02),
 
           // ----------------------------------------------------
           // 花画像
@@ -2592,55 +2012,50 @@ class _TagFolderScreenState
           // これによりStage変更時も鉢底の位置を固定する。
           // ----------------------------------------------------
           SizedBox(
-            width:
-                width,
-            height:
-                imageHeight,
+            width: width,
+            height: imageHeight,
             child: Align(
-              alignment:
-                  Alignment.bottomCenter,
-              child: Image.asset(
-                _flowerStageAsset(
-                  flowerId,
-                  safeStage,
-                ),
-                width:
-                    width,
-                height:
-                    imageHeight,
-                fit:
-                    BoxFit.contain,
-                alignment:
-                    Alignment.bottomCenter,
-                errorBuilder:
-                    (
-                  context,
-                  error,
-                  stackTrace,
-                ) {
-                  return Align(
-                    alignment:
-                        Alignment.bottomCenter,
-                    child: Text(
-                      '$flowerId\n'
-                      'Stage $safeStage',
-                      textAlign:
-                          TextAlign.center,
-                      style:
-                          TextStyle(
-                        fontSize:
-                            bloomFontSize *
-                                0.8,
-                        fontWeight:
-                            FontWeight.w700,
-                        color:
-                            const Color(
-                          0xFF163B59,
+              alignment: Alignment.bottomCenter,
+              child: SizedBox(
+                width: width * 0.90,
+                child: Image.asset(
+                  _flowerStageAsset(flowerId, safeStage),
+
+                  // ==================================================
+                  // Stage画像は横幅を基準に拡大縮小する。
+                  //
+                  // 元画像はStageごとに横幅が同一で、
+                  // 縦幅だけが異なる前提。
+                  //
+                  // heightを指定せずwidthのみを固定することで、
+                  // 植木鉢部分の横方向スケールを
+                  // 全Stageで一定に保つ。
+                  //
+                  // 成長すると画像は上方向へ伸びるが、
+                  // 植木鉢自体の見た目の大きさは変わらない。
+                  // ==================================================
+                  width: width * 0.90,
+
+                  fit: BoxFit.fitWidth,
+
+                  alignment: Alignment.bottomCenter,
+
+                  errorBuilder: (context, error, stackTrace) {
+                    return Align(
+                      alignment: Alignment.bottomCenter,
+                      child: Text(
+                        '$flowerId\n'
+                        'Stage $safeStage',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: bloomFontSize * 0.8,
+                          fontWeight: FontWeight.w700,
+                          color: const Color(0xFF163B59),
                         ),
                       ),
-                    ),
-                  );
-                },
+                    );
+                  },
+                ),
               ),
             ),
           ),
@@ -2651,232 +2066,46 @@ class _TagFolderScreenState
 
   Widget _buildFlowerGarden() {
     return LayoutBuilder(
-      builder:
-          (
-        context,
-        constraints,
-      ) {
-        final width =
-            constraints.maxWidth;
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        final height = constraints.maxHeight;
+        final isPortrait = height > width;
 
-        final height =
-            constraints.maxHeight;
-
-        final isPortrait =
-            height > width;
-
-        // ======================================================
-        // 横型 / 縦型で比率だけ切り替える。
-        //
-        // 固定pxではなく、利用可能領域の幅・高さから算出する。
-        // ======================================================
-
-        final horizontalPadding =
-            width *
-                (isPortrait
-                    ? 0.035
-                    : 0.025);
+        final horizontalPadding = width * (isPortrait ? 0.025 : 0.018);
+        final spacing = width * (isPortrait ? 0.008 : 0.006);
 
         final usableWidth =
-            width -
-                horizontalPadding *
-                    2;
+            width - horizontalPadding * 2 - spacing * (flowerIds.length - 1);
 
-        final frontCellWidth =
-            usableWidth /
-                (isPortrait
-                    ? 4.25
-                    : 4.15);
+        final cellWidth = usableWidth / flowerIds.length;
 
-        final backCellWidth =
-            frontCellWidth *
-                (isPortrait
-                    ? 0.90
-                    : 0.86);
+        final imageHeight = (height * (isPortrait ? 0.55 : 0.62))
+            .clamp(105.0, 300.0)
+            .toDouble();
 
-        final frontImageHeight =
-            height *
-                (isPortrait
-                    ? 0.31
-                    : 0.38);
+        final bloomFontSize = (cellWidth * 0.16).clamp(12.0, 22.0).toDouble();
 
-        final backImageHeight =
-            height *
-                (isPortrait
-                    ? 0.27
-                    : 0.33);
+        final deltaFontSize = (cellWidth * 0.21).clamp(16.0, 30.0).toDouble();
 
-        final bloomFontSize =
-            (width *
-                    (isPortrait
-                        ? 0.032
-                        : 0.015))
-                .clamp(
-                  14.0,
-                  22.0,
-                )
-                .toDouble();
-
-        final deltaFontSize =
-            (width *
-                    (isPortrait
-                        ? 0.041
-                        : 0.020))
-                .clamp(
-                  20.0,
-                  32.0,
-                )
-                .toDouble();
-
-        final backTop =
-            height *
-                (isPortrait
-                    ? 0.02
-                    : 0.00);
-
-        final frontBottom =
-            height *
-                (isPortrait
-                    ? 0.015
-                    : 0.00);
-
-        // ======================================================
-        // 千鳥配置
-        //
-        // 後列: tulip / rose / suzuran
-        // 前列: sunflower / kernation / ajisai / cosmos
-        //
-        //     ●      ●      ●
-        //   ●    ●      ●      ●
-        // ======================================================
-
-        return Stack(
-          clipBehavior:
-              Clip.none,
-          children: [
-            Positioned(
-              left:
-                  horizontalPadding +
-                      usableWidth *
-                          (isPortrait
-                              ? 0.095
-                              : 0.105),
-              right:
-                  horizontalPadding +
-                      usableWidth *
-                          (isPortrait
-                              ? 0.095
-                              : 0.105),
-              top:
-                  backTop,
-              child: Row(
-                mainAxisAlignment:
-                    MainAxisAlignment
-                        .spaceBetween,
-                crossAxisAlignment:
-                    CrossAxisAlignment
-                        .end,
-                children: [
-                  _buildFlowerResultCell(
-                    flowerIds[0],
-                    width:
-                        backCellWidth,
-                    imageHeight:
-                        backImageHeight,
-                    bloomFontSize:
-                        bloomFontSize,
-                    deltaFontSize:
-                        deltaFontSize,
+        return Padding(
+          padding: EdgeInsets.symmetric(horizontal: horizontalPadding),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              for (int i = 0; i < flowerIds.length; i++) ...[
+                Expanded(
+                  child: _buildFlowerResultCell(
+                    flowerIds[i],
+                    width: cellWidth,
+                    imageHeight: imageHeight,
+                    bloomFontSize: bloomFontSize,
+                    deltaFontSize: deltaFontSize,
                   ),
-                  _buildFlowerResultCell(
-                    flowerIds[2],
-                    width:
-                        backCellWidth,
-                    imageHeight:
-                        backImageHeight,
-                    bloomFontSize:
-                        bloomFontSize,
-                    deltaFontSize:
-                        deltaFontSize,
-                  ),
-                  _buildFlowerResultCell(
-                    flowerIds[4],
-                    width:
-                        backCellWidth,
-                    imageHeight:
-                        backImageHeight,
-                    bloomFontSize:
-                        bloomFontSize,
-                    deltaFontSize:
-                        deltaFontSize,
-                  ),
-                ],
-              ),
-            ),
-
-            Positioned(
-              left:
-                  horizontalPadding,
-              right:
-                  horizontalPadding,
-              bottom:
-                  frontBottom,
-              child: Row(
-                mainAxisAlignment:
-                    MainAxisAlignment
-                        .spaceBetween,
-                crossAxisAlignment:
-                    CrossAxisAlignment
-                        .end,
-                children: [
-                  _buildFlowerResultCell(
-                    flowerIds[1],
-                    width:
-                        frontCellWidth,
-                    imageHeight:
-                        frontImageHeight,
-                    bloomFontSize:
-                        bloomFontSize,
-                    deltaFontSize:
-                        deltaFontSize,
-                  ),
-                  _buildFlowerResultCell(
-                    flowerIds[3],
-                    width:
-                        frontCellWidth,
-                    imageHeight:
-                        frontImageHeight,
-                    bloomFontSize:
-                        bloomFontSize,
-                    deltaFontSize:
-                        deltaFontSize,
-                  ),
-                  _buildFlowerResultCell(
-                    flowerIds[5],
-                    width:
-                        frontCellWidth,
-                    imageHeight:
-                        frontImageHeight,
-                    bloomFontSize:
-                        bloomFontSize,
-                    deltaFontSize:
-                        deltaFontSize,
-                  ),
-                  _buildFlowerResultCell(
-                    flowerIds[6],
-                    width:
-                        frontCellWidth,
-                    imageHeight:
-                        frontImageHeight,
-                    bloomFontSize:
-                        bloomFontSize,
-                    deltaFontSize:
-                        deltaFontSize,
-                  ),
-                ],
-              ),
-            ),
-          ],
+                ),
+                if (i != flowerIds.length - 1) SizedBox(width: spacing),
+              ],
+            ],
+          ),
         );
       },
     );
@@ -2887,58 +2116,30 @@ class _TagFolderScreenState
     required double imageSize,
     required double fontSize,
   }) {
-    final count =
-        unusedSeedCounts[flowerId] ??
-            0;
+    final count = unusedSeedCounts[flowerId] ?? 0;
 
     return Expanded(
       child: Column(
-        mainAxisSize:
-            MainAxisSize.min,
+        mainAxisSize: MainAxisSize.min,
         children: [
           Image.asset(
-            _seedAsset(
-              flowerId,
-            ),
-            width:
-                imageSize,
-            height:
-                imageSize,
-            fit:
-                BoxFit.contain,
-            errorBuilder:
-                (
-              context,
-              error,
-              stackTrace,
-            ) {
-              return SizedBox(
-                width:
-                    imageSize,
-                height:
-                    imageSize,
-              );
+            _seedAsset(flowerId),
+            width: imageSize,
+            height: imageSize,
+            fit: BoxFit.contain,
+            errorBuilder: (context, error, stackTrace) {
+              return SizedBox(width: imageSize, height: imageSize);
             },
           ),
 
-          SizedBox(
-            height:
-                imageSize *
-                    0.08,
-          ),
+          SizedBox(height: imageSize * 0.08),
 
           Text(
             '×$count',
-            style:
-                TextStyle(
-              fontSize:
-                  fontSize,
-              fontWeight:
-                  FontWeight.w900,
-              color:
-                  const Color(
-                0xFF5D4633,
-              ),
+            style: TextStyle(
+              fontSize: fontSize,
+              fontWeight: FontWeight.w900,
+              color: const Color(0xFF5D4633),
             ),
           ),
         ],
@@ -2946,152 +2147,131 @@ class _TagFolderScreenState
     );
   }
 
+  Widget _buildAlignedFlowerResultRow({
+    required double availableWidth,
+    required double availableHeight,
+  }) {
+    // 待機中・処理中・完了画面と完全に同じ横幅基準を使う。
+    // 7セルに等分し、各画像の横幅をセル幅の90%に固定する。
+    final cellWidth = availableWidth / flowerIds.length;
+
+    // Stageごとに縦幅だけが異なるため、十分な高さの共通領域を確保し、
+    // 画像はbottomCenterにそろえる。
+    // 画像そのものの拡大率はwidthだけで決まり、heightでは変化しない。
+    final imageHeight = (availableHeight * 0.56)
+        .clamp(180.0, 420.0)
+        .toDouble();
+
+    final bloomFontSize = (cellWidth * 0.16).clamp(12.0, 22.0).toDouble();
+    final deltaFontSize = (cellWidth * 0.21).clamp(16.0, 30.0).toDouble();
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        for (final flowerId in flowerIds)
+          SizedBox(
+            width: cellWidth,
+            child: _buildFlowerResultCell(
+              flowerId,
+              width: cellWidth,
+              imageHeight: imageHeight,
+              bloomFontSize: bloomFontSize,
+              deltaFontSize: deltaFontSize,
+            ),
+          ),
+      ],
+    );
+  }
+
   Widget _buildResultScreen() {
     return LayoutBuilder(
-      builder:
-          (
-        context,
-        constraints,
-      ) {
-        final width =
-            constraints.maxWidth;
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        final height = constraints.maxHeight;
+        final isPortrait = height > width;
 
-        final height =
-            constraints.maxHeight;
+        // ========================================================
+        // 花画像の基準位置
+        // ========================================================
+        // 待機・処理中・完了画面の _buildSimpleState / _buildTakeState と
+        // 完全に同じ値にする。
+        //
+        // 横方向:
+        //   left/right = 画面幅の2.5%
+        //   7等分
+        //   画像横幅 = 各セルの90%
+        //
+        // 縦方向:
+        //   画像の下辺 = 地面上端付近の同一位置
+        //
+        // これにより全flower・全stageで「横幅」と「下辺」を固定する。
+        final flowerHorizontalMargin = width * 0.025;
+        final flowerAvailableWidth = width * 0.95;
+        final flowerBottom = height / 3 - height * 0.018;
 
-        final isPortrait =
-            height > width;
+        final seedImageSize = (width * (isPortrait ? 0.080 : 0.038))
+            .clamp(32.0, 62.0)
+            .toDouble();
 
-        final horizontalPadding =
-            width *
-                (isPortrait
-                    ? 0.035
-                    : 0.022);
+        final seedFontSize = (width * (isPortrait ? 0.035 : 0.016))
+            .clamp(16.0, 24.0)
+            .toDouble();
 
-        final topPadding =
-            height *
-                (isPortrait
-                    ? 0.045
-                    : 0.035);
+        final seedTitleFontSize = (width * (isPortrait ? 0.036 : 0.017))
+            .clamp(18.0, 25.0)
+            .toDouble();
 
-        final bottomPadding =
-            height *
-                0.015;
-
-        final seedImageSize =
-            (width *
-                    (isPortrait
-                        ? 0.080
-                        : 0.038))
-                .clamp(
-                  32.0,
-                  62.0,
-                )
-                .toDouble();
-
-        final seedFontSize =
-            (width *
-                    (isPortrait
-                        ? 0.035
-                        : 0.016))
-                .clamp(
-                  16.0,
-                  24.0,
-                )
-                .toDouble();
-
-        final seedTitleFontSize =
-            (width *
-                    (isPortrait
-                        ? 0.036
-                        : 0.017))
-                .clamp(
-                  18.0,
-                  25.0,
-                )
-                .toDouble();
-
-        // 縦型では花壇を大きく取り、
-        // 種エリアは下部へまとめる。
-        final gardenFlex =
-            isPortrait
-                ? 8
-                : 7;
-
-        final seedFlex =
-            isPortrait
-                ? 2
-                : 2;
-
-        return Padding(
-          padding:
-              EdgeInsets.fromLTRB(
-            horizontalPadding,
-            topPadding,
-            horizontalPadding,
-            bottomPadding,
-          ),
-          child: Column(
-            children: [
-              Expanded(
-                flex:
-                    gardenFlex,
-                child:
-                    _buildFlowerGarden(),
+        return Stack(
+          clipBehavior: Clip.none,
+          children: [
+            // ----------------------------------------------------
+            // 花：待機画面などと同じ下辺位置・同じ横幅
+            // ----------------------------------------------------
+            Positioned(
+              left: flowerHorizontalMargin,
+              right: flowerHorizontalMargin,
+              bottom: flowerBottom,
+              child: _buildAlignedFlowerResultRow(
+                availableWidth: flowerAvailableWidth,
+                availableHeight: height,
               ),
+            ),
 
-              SizedBox(
-                height:
-                    height *
-                        0.010,
-              ),
-
-              Expanded(
-                flex:
-                    seedFlex,
-                child: Column(
-                  mainAxisAlignment:
-                      MainAxisAlignment.center,
-                  children: [
-                    Text(
-                      '持っている種（未使用）',
-                      style:
-                          TextStyle(
-                        fontSize:
-                            seedTitleFontSize,
-                        fontWeight:
-                            FontWeight.w900,
-                        color:
-                            const Color(
-                          0xFF5D4633,
+            // ----------------------------------------------------
+            // 種表示
+            // 花の位置計算とは完全に独立させる。
+            // 種エリアの高さによって花が上下したり縮小したりしない。
+            // ----------------------------------------------------
+            Positioned(
+              left: width * 0.035,
+              right: width * 0.035,
+              bottom: height * 0.018,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    '持っている種（未使用）',
+                    style: TextStyle(
+                      fontSize: seedTitleFontSize,
+                      fontWeight: FontWeight.w900,
+                      color: const Color(0xFF5D4633),
+                    ),
+                  ),
+                  SizedBox(height: height * 0.008),
+                  Row(
+                    children: [
+                      for (final flowerId in flowerIds)
+                        _buildSeedResultCell(
+                          flowerId,
+                          imageSize: seedImageSize,
+                          fontSize: seedFontSize,
                         ),
-                      ),
-                    ),
-
-                    SizedBox(
-                      height:
-                          height *
-                              0.008,
-                    ),
-
-                    Row(
-                      children: [
-                        for (final flowerId
-                            in flowerIds)
-                          _buildSeedResultCell(
-                            flowerId,
-                            imageSize:
-                                seedImageSize,
-                            fontSize:
-                                seedFontSize,
-                          ),
-                      ],
-                    ),
-                  ],
-                ),
+                    ],
+                  ),
+                ],
               ),
-            ],
-          ),
+            ),
+          ],
         );
       },
     );
@@ -3101,45 +2281,22 @@ class _TagFolderScreenState
   // TAKE / WAITING MESSAGE
   // ============================================================
 
-  Widget _buildTakeState({
-    required String message,
-  }) {
+  Widget _buildTakeState({required String message}) {
     return LayoutBuilder(
-      builder:
-          (
-        context,
-        constraints,
-      ) {
-        final width =
-            constraints.maxWidth;
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
 
-        final height =
-            constraints.maxHeight;
+        final height = constraints.maxHeight;
 
-        final isPortrait =
-            height > width;
+        final isPortrait = height > width;
 
-        final handHeight =
-            (height *
-                    (isPortrait
-                        ? 0.16
-                        : 0.17))
-                .clamp(
-                  90.0,
-                  170.0,
-                )
-                .toDouble();
+        final handHeight = (height * (isPortrait ? 0.16 : 0.17))
+            .clamp(90.0, 170.0)
+            .toDouble();
 
-        final messageFontSize =
-            (width *
-                    (isPortrait
-                        ? 0.060
-                        : 0.028))
-                .clamp(
-                  30.0,
-                  48.0,
-                )
-                .toDouble();
+        final messageFontSize = (width * (isPortrait ? 0.060 : 0.028))
+            .clamp(30.0, 48.0)
+            .toDouble();
 
         return Stack(
           children: [
@@ -3149,24 +2306,12 @@ class _TagFolderScreenState
             // 縦横比が変わっても鉢位置が大きく崩れない。
             // --------------------------------------------------
             Positioned(
-              left:
-                  width *
-                      0.025,
-              right:
-                  width *
-                      0.025,
-              bottom:
-                  height /
-                          3 -
-                      height *
-                          0.018,
-              child:
-                  _buildResponsiveEmptyPotsRow(
-                availableWidth:
-                    width *
-                        0.95,
-                availableHeight:
-                    height,
+              left: width * 0.025,
+              right: width * 0.025,
+              bottom: height / 3 - height * 0.018,
+              child: _buildResponsiveEmptyPotsRow(
+                availableWidth: width * 0.95,
+                availableHeight: height,
               ),
             ),
 
@@ -3175,48 +2320,26 @@ class _TagFolderScreenState
             // --------------------------------------------------
             Positioned.fill(
               child: Center(
-                child:
-                    Transform.translate(
-                  offset:
-                      Offset(
-                    0,
-                    -height *
-                        (isPortrait
-                            ? 0.10
-                            : 0.045),
-                  ),
+                child: Transform.translate(
+                  offset: Offset(0, -height * (isPortrait ? 0.10 : 0.045)),
                   child: Column(
-                    mainAxisSize:
-                        MainAxisSize.min,
+                    mainAxisSize: MainAxisSize.min,
                     children: [
                       Image.asset(
                         'assets/images/take.png',
-                        height:
-                            handHeight,
-                        fit:
-                            BoxFit.contain,
+                        height: handHeight,
+                        fit: BoxFit.contain,
                       ),
 
-                      SizedBox(
-                        height:
-                            height *
-                                0.018,
-                      ),
+                      SizedBox(height: height * 0.018),
 
                       Text(
                         message,
-                        textAlign:
-                            TextAlign.center,
-                        style:
-                            TextStyle(
-                          fontSize:
-                              messageFontSize,
-                          fontWeight:
-                              FontWeight.w900,
-                          color:
-                              const Color(
-                            0xFF163B59,
-                          ),
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: messageFontSize,
+                          fontWeight: FontWeight.w900,
+                          color: const Color(0xFF163B59),
                         ),
                       ),
                     ],
@@ -3234,54 +2357,37 @@ class _TagFolderScreenState
     required double availableWidth,
     required double availableHeight,
   }) {
-    final isPortrait =
-        availableHeight >
-            availableWidth;
+    final isPortrait = availableHeight > availableWidth;
 
-    final potHeight =
-        (availableHeight *
-                (isPortrait
-                    ? 0.095
-                    : 0.15))
-            .clamp(
-              65.0,
-              150.0,
-            )
-            .toDouble();
+    // 全画面で花画像の基準を統一する。
+    // 結果画面と同じく「横幅90%・下辺bottomCenter」を基準にする。
+    // height基準にすると元画像の縦横比によって鉢の横幅が変わるため、
+    // Stage0表示も必ずwidth基準で拡大縮小する。
+    final cellWidth = availableWidth / flowerIds.length;
+    final imageWidth = cellWidth * 0.90;
+
+    final imageAreaHeight = (availableHeight * (isPortrait ? 0.095 : 0.15))
+        .clamp(65.0, 150.0)
+        .toDouble();
 
     return Row(
-      crossAxisAlignment:
-          CrossAxisAlignment.end,
+      crossAxisAlignment: CrossAxisAlignment.end,
       children: [
-        for (final flowerId
-            in flowerIds)
+        for (final flowerId in flowerIds)
           Expanded(
             child: SizedBox(
-              height:
-                  potHeight,
+              height: imageAreaHeight,
               child: Align(
-                alignment:
-                    Alignment.bottomCenter,
+                alignment: Alignment.bottomCenter,
                 child: Image.asset(
-                  _flowerStageAsset(
-                    flowerId,
-                    0,
-                  ),
-                  height:
-                      potHeight,
-                  fit:
-                      BoxFit.contain,
-                  alignment:
-                      Alignment.bottomCenter,
-                  errorBuilder:
-                      (
-                    context,
-                    error,
-                    stackTrace,
-                  ) {
+                  _flowerStageAsset(flowerId, 0),
+                  width: imageWidth,
+                  fit: BoxFit.fitWidth,
+                  alignment: Alignment.bottomCenter,
+                  errorBuilder: (context, error, stackTrace) {
                     return SizedBox(
-                      height:
-                          potHeight,
+                      width: imageWidth,
+                      height: imageAreaHeight,
                     );
                   },
                 ),
@@ -3292,6 +2398,75 @@ class _TagFolderScreenState
     );
   }
 
+  Widget _buildErrorState() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        final height = constraints.maxHeight;
+        final isPortrait = height > width;
+
+        final titleSize = (width * (isPortrait ? 0.060 : 0.030))
+            .clamp(30.0, 52.0)
+            .toDouble();
+
+        final bodySize = (width * (isPortrait ? 0.038 : 0.020))
+            .clamp(20.0, 32.0)
+            .toDouble();
+
+        return Center(
+          child: Padding(
+            padding: EdgeInsets.symmetric(horizontal: width * 0.08),
+            child: Container(
+              padding: EdgeInsets.all(width * 0.035),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.95),
+                borderRadius: BorderRadius.circular(28),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    'エラーが発生しました',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: titleSize,
+                      fontWeight: FontWeight.w900,
+                      color: const Color(0xFFC62828),
+                    ),
+                  ),
+                  SizedBox(height: height * 0.025),
+                  Text(
+                    '一度タグを抜いてください\n15秒以上表示した後、物理的な抜線を確認すると待機画面へ戻ります',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: bodySize,
+                      fontWeight: FontWeight.w800,
+                      color: const Color(0xFF163B59),
+                    ),
+                  ),
+                  if (errorMessage != null) ...[
+                    SizedBox(height: height * 0.025),
+                    Text(
+                      errorMessage!,
+                      textAlign: TextAlign.center,
+                      maxLines: 5,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: bodySize * 0.60,
+                        color: const Color(0xFF6D4C41),
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   // ============================================================
   // MAIN SIGNAGE CONTENT
   // ============================================================
@@ -3299,20 +2474,14 @@ class _TagFolderScreenState
   Widget _buildMainSignageContent() {
     switch (signageViewState) {
       case SignageViewState.waiting:
-        return _buildTakeState(
-          message:
-              '接続してください',
-        );
+        return _buildTakeState(message: '接続してください');
 
       case SignageViewState.processing:
         return Center(
           child: _buildSimpleState(
-            handImage:
-                'assets/images/no_take.png',
-            message:
-                '抜かないでください',
-            showProgress:
-                true,
+            handImage: 'assets/images/no_take.png',
+            message: '抜かないでください',
+            showProgress: true,
           ),
         );
 
@@ -3321,10 +2490,10 @@ class _TagFolderScreenState
         return _buildResultScreen();
 
       case SignageViewState.complete:
-        return _buildTakeState(
-          message:
-              '抜いても大丈夫です',
-        );
+        return _buildTakeState(message: '抜いても大丈夫です');
+
+      case SignageViewState.error:
+        return _buildErrorState();
     }
   }
 
@@ -3347,31 +2516,7 @@ class _TagFolderScreenState
         child: Stack(
           children: [
             _buildWorldBackground(),
-            Positioned.fill(
-              child: _buildMainSignageContent(),
-            ),
-            if (errorMessage != null)
-              Positioned(
-                left: 30,
-                right: 30,
-                bottom: 30,
-                child: Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.94),
-                    borderRadius: BorderRadius.circular(18),
-                  ),
-                  child: Text(
-                    errorMessage!,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      fontSize: 18,
-                      color: Colors.redAccent,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-              ),
+            Positioned.fill(child: _buildMainSignageContent()),
           ],
         ),
       ),

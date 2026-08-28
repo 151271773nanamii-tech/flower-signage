@@ -9,6 +9,42 @@ class DatabaseService {
 
   Database? _database;
 
+  // 1回のタグ処理をSQLiteの1Transactionとしてまとめるための
+  // ambient executor。runInTransaction()中は全DBメソッドが
+  // 同じTransactionを使用する。
+  DatabaseExecutor? _transactionExecutor;
+
+  Future<DatabaseExecutor> get _executor async {
+    return _transactionExecutor ?? await database;
+  }
+
+  Future<T> runInTransaction<T>(Future<T> Function() action) async {
+    if (_transactionExecutor != null) {
+      // すでにTransaction内なら、そのまま同じTransactionを使う。
+      return action();
+    }
+
+    final db = await database;
+    return db.transaction((txn) async {
+      _transactionExecutor = txn;
+      try {
+        return await action();
+      } finally {
+        _transactionExecutor = null;
+      }
+    });
+  }
+
+  Future<T> _runNestedSafe<T>(
+    Future<T> Function(DatabaseExecutor executor) action,
+  ) async {
+    final executor = await _executor;
+    if (executor is Transaction) {
+      return action(executor);
+    }
+    return (executor as Database).transaction(action);
+  }
+
   // 新要件では旧DBを上書きせず、新しいDBへ保存する。
   static const String _databaseFileName = 'flower_signage_v2.db';
   static const int _databaseVersion = 1;
@@ -59,19 +95,16 @@ class DatabaseService {
   }
 
   Future<void> _onCreate(Database db, int version) async {
-    await db.execute(
-      '''
+    await db.execute('''
       CREATE TABLE users (
         user_id TEXT PRIMARY KEY,
         tag_mac TEXT NOT NULL UNIQUE,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )
-      ''',
-    );
+      ''');
 
-    await db.execute(
-      '''
+    await db.execute('''
       CREATE TABLE seed_inventory (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
@@ -86,11 +119,9 @@ class DatabaseService {
           REFERENCES users(user_id)
           ON DELETE CASCADE
       )
-      ''',
-    );
+      ''');
 
-    await db.execute(
-      '''
+    await db.execute('''
       CREATE TABLE user_flowers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
@@ -111,11 +142,9 @@ class DatabaseService {
           REFERENCES seed_inventory(id)
           ON DELETE SET NULL
       )
-      ''',
-    );
+      ''');
 
-    await db.execute(
-      '''
+    await db.execute('''
       CREATE TABLE import_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
@@ -130,11 +159,9 @@ class DatabaseService {
           REFERENCES users(user_id)
           ON DELETE CASCADE
       )
-      ''',
-    );
+      ''');
 
-    await db.execute(
-      '''
+    await db.execute('''
       CREATE TABLE import_batches (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
@@ -152,11 +179,9 @@ class DatabaseService {
           REFERENCES users(user_id)
           ON DELETE CASCADE
       )
-      ''',
-    );
+      ''');
 
-    await db.execute(
-      '''
+    await db.execute('''
       CREATE TABLE log_archive (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
@@ -178,11 +203,9 @@ class DatabaseService {
           ON DELETE SET NULL,
         UNIQUE(user_id, file_hash)
       )
-      ''',
-    );
+      ''');
 
-    await db.execute(
-      '''
+    await db.execute('''
       CREATE TABLE result_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
@@ -203,8 +226,7 @@ class DatabaseService {
           REFERENCES import_batches(id)
           ON DELETE SET NULL
       )
-      ''',
-    );
+      ''');
 
     await _createIndexes(db);
   }
@@ -262,23 +284,19 @@ class DatabaseService {
 
   void _validateStage(int stage) {
     if (stage < 0 || stage > 6) {
-      throw ArgumentError(
-        'stageは0〜6である必要があります。現在値: $stage',
-      );
+      throw ArgumentError('stageは0〜6である必要があります。現在値: $stage');
     }
   }
 
   void _validateGrowthValue(int growthValue) {
     if (growthValue < 0) {
-      throw ArgumentError(
-        'growthValueは0以上である必要があります。現在値: $growthValue',
-      );
+      throw ArgumentError('growthValueは0以上である必要があります。現在値: $growthValue');
     }
   }
 
   Future<bool> testConnection() async {
     try {
-      final db = await database;
+      final db = await _executor;
       await db.rawQuery('SELECT 1');
       return true;
     } catch (_) {
@@ -290,7 +308,7 @@ class DatabaseService {
     required String userId,
     required String tagMac,
   }) async {
-    final db = await database;
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
     final normalizedMac = tagMac.trim().toUpperCase();
 
@@ -302,36 +320,30 @@ class DatabaseService {
     );
 
     if (existing.isEmpty) {
-      await db.insert(
-        'users',
-        {
-          'user_id': userId,
-          'tag_mac': normalizedMac,
-          'created_at': now,
-          'updated_at': now,
-        },
-      );
+      await db.insert('users', {
+        'user_id': userId,
+        'tag_mac': normalizedMac,
+        'created_at': now,
+        'updated_at': now,
+      });
       return;
     }
 
     await db.update(
       'users',
-      {
-        'tag_mac': normalizedMac,
-        'updated_at': now,
-      },
+      {'tag_mac': normalizedMac, 'updated_at': now},
       where: 'user_id = ?',
       whereArgs: [userId],
     );
   }
 
   Future<List<Map<String, Object?>>> getUsers() async {
-    final db = await database;
+    final db = await _executor;
     return db.query('users', orderBy: 'user_id ASC');
   }
 
   Future<Map<String, Object?>?> getUser(String userId) async {
-    final db = await database;
+    final db = await _executor;
     final result = await db.query(
       'users',
       where: 'user_id = ?',
@@ -346,9 +358,9 @@ class DatabaseService {
     required String userId,
     required List<String> initialSeeds,
   }) async {
-    final db = await database;
+    final db = await _executor;
 
-    await db.transaction((txn) async {
+    await _runNestedSafe((txn) async {
       final users = await txn.query(
         'users',
         columns: ['created_at'],
@@ -358,16 +370,12 @@ class DatabaseService {
       );
 
       if (users.isEmpty) {
-        throw Exception(
-          '初期種追加時にユーザーが見つかりません。\nuser_id: $userId',
-        );
+        throw Exception('初期種追加時にユーザーが見つかりません。\nuser_id: $userId');
       }
 
       final acquiredAt = users.first['created_at']?.toString();
       if (acquiredAt == null || acquiredAt.isEmpty) {
-        throw Exception(
-          'ユーザー作成日時を取得できませんでした。\nuser_id: $userId',
-        );
+        throw Exception('ユーザー作成日時を取得できませんでした。\nuser_id: $userId');
       }
 
       for (var i = 0; i < initialSeeds.length; i++) {
@@ -394,18 +402,15 @@ class DatabaseService {
 
         if (existing.isNotEmpty) continue;
 
-        await txn.insert(
-          'seed_inventory',
-          {
-            'user_id': userId,
-            'flower_id': flowerId,
-            'source_type': 'initial',
-            'source_id': sourceId,
-            'acquired_at': acquiredAt,
-            'used': 0,
-            'used_at': null,
-          },
-        );
+        await txn.insert('seed_inventory', {
+          'user_id': userId,
+          'flower_id': flowerId,
+          'source_type': 'initial',
+          'source_id': sourceId,
+          'acquired_at': acquiredAt,
+          'used': 0,
+          'used_at': null,
+        });
       }
     });
   }
@@ -418,28 +423,24 @@ class DatabaseService {
   }) async {
     _validateFlowerId(flowerId);
 
-    final db = await database;
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
-    final id = await db.insert(
-      'seed_inventory',
-      {
-        'user_id': userId,
-        'flower_id': flowerId,
-        'source_type': sourceType,
-        'source_id': sourceId,
-        'acquired_at': now,
-        'used': 0,
-        'used_at': null,
-      },
-      conflictAlgorithm: ConflictAlgorithm.ignore,
-    );
+    final id = await db.insert('seed_inventory', {
+      'user_id': userId,
+      'flower_id': flowerId,
+      'source_type': sourceType,
+      'source_id': sourceId,
+      'acquired_at': now,
+      'used': 0,
+      'used_at': null,
+    }, conflictAlgorithm: ConflictAlgorithm.ignore);
 
     return id != 0;
   }
 
   Future<List<Map<String, Object?>>> getSeeds(String userId) async {
-    final db = await database;
+    final db = await _executor;
     return db.query(
       'seed_inventory',
       where: 'user_id = ?',
@@ -449,7 +450,7 @@ class DatabaseService {
   }
 
   Future<Map<String, Object?>?> getNextUnusedSeed(String userId) async {
-    final db = await database;
+    final db = await _executor;
     final result = await db.query(
       'seed_inventory',
       where: 'user_id = ? AND used = 0',
@@ -467,7 +468,7 @@ class DatabaseService {
   }) async {
     _validateFlowerId(flowerId);
 
-    final db = await database;
+    final db = await _executor;
     final result = await db.query(
       'seed_inventory',
       where: 'user_id = ? AND flower_id = ? AND used = 0',
@@ -480,7 +481,7 @@ class DatabaseService {
   }
 
   Future<void> markSeedUsed(int seedId) async {
-    final db = await database;
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
     final count = await db.update(
@@ -503,7 +504,7 @@ class DatabaseService {
   }) async {
     _validateFlowerId(flowerId);
 
-    final db = await database;
+    final db = await _executor;
     final result = await db.query(
       'seed_inventory',
       columns: ['id'],
@@ -520,7 +521,7 @@ class DatabaseService {
   }
 
   Future<Map<String, int>> getUnusedSeedCounts(String userId) async {
-    final db = await database;
+    final db = await _executor;
     final rows = await db.rawQuery(
       '''
       SELECT flower_id, COUNT(*) AS count
@@ -545,7 +546,7 @@ class DatabaseService {
   }
 
   Future<bool> isImportProcessed(String importHash) async {
-    final db = await database;
+    final db = await _executor;
     final result = await db.query(
       'import_history',
       columns: ['id', 'status'],
@@ -566,27 +567,23 @@ class DatabaseService {
     required int uniqueAddressCount,
     required String status,
   }) async {
-    final db = await database;
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
-    await db.insert(
-      'import_history',
-      {
-        'user_id': userId,
-        'import_hash': importHash,
-        'imported_at': now,
-        'growth_metric': growthMetric,
-        'growth_value': growthValue,
-        'record_count': recordCount,
-        'unique_address_count': uniqueAddressCount,
-        'status': status,
-      },
-      conflictAlgorithm: ConflictAlgorithm.ignore,
-    );
+    await db.insert('import_history', {
+      'user_id': userId,
+      'import_hash': importHash,
+      'imported_at': now,
+      'growth_metric': growthMetric,
+      'growth_value': growthValue,
+      'record_count': recordCount,
+      'unique_address_count': uniqueAddressCount,
+      'status': status,
+    }, conflictAlgorithm: ConflictAlgorithm.ignore);
   }
 
   Future<List<Map<String, Object?>>> getImportHistory(String userId) async {
-    final db = await database;
+    final db = await _executor;
     return db.query(
       'import_history',
       where: 'user_id = ?',
@@ -596,7 +593,7 @@ class DatabaseService {
   }
 
   Future<int> getImportCount(String userId) async {
-    final db = await database;
+    final db = await _executor;
     final result = await db.rawQuery(
       '''
       SELECT COUNT(*) AS count
@@ -616,7 +613,7 @@ class DatabaseService {
   }) async {
     _validateFlowerId(flowerId);
 
-    final db = await database;
+    final db = await _executor;
     final existing = await db.query(
       'user_flowers',
       columns: ['id'],
@@ -635,21 +632,18 @@ class DatabaseService {
 
     final now = DateTime.now().toIso8601String();
 
-    await db.insert(
-      'user_flowers',
-      {
-        'user_id': userId,
-        'seed_id': null,
-        'flower_id': flowerId,
-        'growth_value': 0,
-        'stage': 0,
-        'is_active': active ? 1 : 0,
-        'is_bloomed': 0,
-        'acquired_at': now,
-        'bloomed_at': null,
-        'updated_at': now,
-      },
-    );
+    await db.insert('user_flowers', {
+      'user_id': userId,
+      'seed_id': null,
+      'flower_id': flowerId,
+      'growth_value': 0,
+      'stage': 0,
+      'is_active': active ? 1 : 0,
+      'is_bloomed': 0,
+      'acquired_at': now,
+      'bloomed_at': null,
+      'updated_at': now,
+    });
   }
 
   Future<Map<String, Object?>?> getFlower({
@@ -658,7 +652,7 @@ class DatabaseService {
   }) async {
     _validateFlowerId(flowerId);
 
-    final db = await database;
+    final db = await _executor;
     final result = await db.query(
       'user_flowers',
       where: 'user_id = ? AND flower_id = ?',
@@ -671,7 +665,7 @@ class DatabaseService {
   }
 
   Future<Map<String, Object?>?> getFlowerById(int userFlowerId) async {
-    final db = await database;
+    final db = await _executor;
     final result = await db.query(
       'user_flowers',
       where: 'id = ?',
@@ -683,7 +677,7 @@ class DatabaseService {
   }
 
   Future<List<Map<String, Object?>>> getFlowers(String userId) async {
-    final db = await database;
+    final db = await _executor;
     return db.query(
       'user_flowers',
       where: 'user_id = ?',
@@ -693,7 +687,7 @@ class DatabaseService {
   }
 
   Future<Map<String, Object?>?> getActiveFlower(String userId) async {
-    final db = await database;
+    final db = await _executor;
     final result = await db.query(
       'user_flowers',
       where: 'user_id = ? AND is_active = 1 AND is_bloomed = 0',
@@ -711,7 +705,7 @@ class DatabaseService {
   }) async {
     _validateFlowerId(flowerId);
 
-    final db = await database;
+    final db = await _executor;
     final rows = await db.query(
       'user_flowers',
       where: '''
@@ -731,7 +725,7 @@ class DatabaseService {
   Future<Map<String, Map<String, Object?>>> getActiveFlowersByType(
     String userId,
   ) async {
-    final db = await database;
+    final db = await _executor;
     final rows = await db.query(
       'user_flowers',
       where: 'user_id = ? AND is_active = 1 AND is_bloomed = 0',
@@ -755,24 +749,18 @@ class DatabaseService {
     _validateGrowthValue(growthValue);
     _validateStage(stage);
 
-    final db = await database;
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
     final count = await db.update(
       'user_flowers',
-      {
-        'growth_value': growthValue,
-        'stage': stage,
-        'updated_at': now,
-      },
+      {'growth_value': growthValue, 'stage': stage, 'updated_at': now},
       where: 'id = ? AND is_bloomed = 0',
       whereArgs: [userFlowerId],
     );
 
     if (count != 1) {
-      throw Exception(
-        '花の成長状態更新に失敗しました。\nuser_flower_id: $userFlowerId',
-      );
+      throw Exception('花の成長状態更新に失敗しました。\nuser_flower_id: $userFlowerId');
     }
   }
 
@@ -784,9 +772,9 @@ class DatabaseService {
     _validateGrowthValue(growthValueDelta);
     _validateStage(stageAfter);
 
-    final db = await database;
+    final db = await _executor;
 
-    return db.transaction((txn) async {
+    return _runNestedSafe((txn) async {
       final rows = await txn.query(
         'user_flowers',
         where: 'id = ?',
@@ -795,9 +783,7 @@ class DatabaseService {
       );
 
       if (rows.isEmpty) {
-        throw Exception(
-          '成長対象の花が見つかりません。\nuser_flower_id: $userFlowerId',
-        );
+        throw Exception('成長対象の花が見つかりません。\nuser_flower_id: $userFlowerId');
       }
 
       final row = rows.first;
@@ -808,26 +794,19 @@ class DatabaseService {
         );
       }
 
-      final currentGrowth =
-          (row['growth_value'] as num?)?.toInt() ?? 0;
+      final currentGrowth = (row['growth_value'] as num?)?.toInt() ?? 0;
       final newGrowth = currentGrowth + growthValueDelta;
       final now = DateTime.now().toIso8601String();
 
       final count = await txn.update(
         'user_flowers',
-        {
-          'growth_value': newGrowth,
-          'stage': stageAfter,
-          'updated_at': now,
-        },
+        {'growth_value': newGrowth, 'stage': stageAfter, 'updated_at': now},
         where: 'id = ?',
         whereArgs: [userFlowerId],
       );
 
       if (count != 1) {
-        throw Exception(
-          '花の成長量加算に失敗しました。\nuser_flower_id: $userFlowerId',
-        );
+        throw Exception('花の成長量加算に失敗しました。\nuser_flower_id: $userFlowerId');
       }
 
       final updated = await txn.query(
@@ -847,9 +826,9 @@ class DatabaseService {
   }) async {
     _validateFlowerId(flowerId);
 
-    final db = await database;
+    final db = await _executor;
 
-    await db.transaction((txn) async {
+    await _runNestedSafe((txn) async {
       final candidates = await txn.query(
         'user_flowers',
         columns: ['id'],
@@ -867,28 +846,20 @@ class DatabaseService {
 
       await txn.update(
         'user_flowers',
-        {
-          'is_active': 0,
-          'updated_at': DateTime.now().toIso8601String(),
-        },
+        {'is_active': 0, 'updated_at': DateTime.now().toIso8601String()},
         where: 'user_id = ? AND flower_id = ? AND is_bloomed = 0',
         whereArgs: [userId, flowerId],
       );
 
       final count = await txn.update(
         'user_flowers',
-        {
-          'is_active': 1,
-          'updated_at': DateTime.now().toIso8601String(),
-        },
+        {'is_active': 1, 'updated_at': DateTime.now().toIso8601String()},
         where: 'id = ? AND is_bloomed = 0',
         whereArgs: [targetId],
       );
 
       if (count != 1) {
-        throw Exception(
-          '育成する花の変更に失敗しました。\nuser_flower_id: $targetId',
-        );
+        throw Exception('育成する花の変更に失敗しました。\nuser_flower_id: $targetId');
       }
     });
   }
@@ -901,7 +872,7 @@ class DatabaseService {
     _validateGrowthValue(growthValue);
     _validateStage(maxStage);
 
-    final db = await database;
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
     final count = await db.update(
@@ -919,9 +890,7 @@ class DatabaseService {
     );
 
     if (count != 1) {
-      throw Exception(
-        '開花状態の保存に失敗しました。\nuser_flower_id: $userFlowerId',
-      );
+      throw Exception('開花状態の保存に失敗しました。\nuser_flower_id: $userFlowerId');
     }
   }
 
@@ -933,9 +902,9 @@ class DatabaseService {
     _validateGrowthValue(growthValueDelta);
     _validateStage(maxStage);
 
-    final db = await database;
+    final db = await _executor;
 
-    return db.transaction((txn) async {
+    return _runNestedSafe((txn) async {
       final rows = await txn.query(
         'user_flowers',
         where: 'id = ?',
@@ -944,20 +913,15 @@ class DatabaseService {
       );
 
       if (rows.isEmpty) {
-        throw Exception(
-          '開花対象の花が見つかりません。\nuser_flower_id: $userFlowerId',
-        );
+        throw Exception('開花対象の花が見つかりません。\nuser_flower_id: $userFlowerId');
       }
 
       final row = rows.first;
       if ((row['is_bloomed'] as num?)?.toInt() == 1) {
-        throw Exception(
-          'すでに開花済みです。\nuser_flower_id: $userFlowerId',
-        );
+        throw Exception('すでに開花済みです。\nuser_flower_id: $userFlowerId');
       }
 
-      final currentGrowth =
-          (row['growth_value'] as num?)?.toInt() ?? 0;
+      final currentGrowth = (row['growth_value'] as num?)?.toInt() ?? 0;
       final newGrowth = currentGrowth + growthValueDelta;
       final now = DateTime.now().toIso8601String();
 
@@ -976,9 +940,7 @@ class DatabaseService {
       );
 
       if (count != 1) {
-        throw Exception(
-          '開花状態の保存に失敗しました。\nuser_flower_id: $userFlowerId',
-        );
+        throw Exception('開花状態の保存に失敗しました。\nuser_flower_id: $userFlowerId');
       }
 
       final updated = await txn.query(
@@ -992,9 +954,9 @@ class DatabaseService {
   }
 
   Future<Map<String, Object?>?> activateNextSeed(String userId) async {
-    final db = await database;
+    final db = await _executor;
 
-    return db.transaction((txn) async {
+    return _runNestedSafe((txn) async {
       final seeds = await txn.query(
         'seed_inventory',
         where: 'user_id = ? AND used = 0',
@@ -1044,9 +1006,9 @@ class DatabaseService {
     _validateStage(initialStage);
     _validateGrowthValue(initialGrowthValue);
 
-    final db = await database;
+    final db = await _executor;
 
-    return db.transaction((txn) async {
+    return _runNestedSafe((txn) async {
       final active = await txn.query(
         'user_flowers',
         where: '''
@@ -1094,21 +1056,18 @@ class DatabaseService {
     final seedId = (seeds.first['id'] as num).toInt();
     final now = DateTime.now().toIso8601String();
 
-    final flowerRowId = await txn.insert(
-      'user_flowers',
-      {
-        'user_id': userId,
-        'seed_id': seedId,
-        'flower_id': flowerId,
-        'growth_value': initialGrowthValue,
-        'stage': initialStage,
-        'is_active': 1,
-        'is_bloomed': 0,
-        'acquired_at': now,
-        'bloomed_at': null,
-        'updated_at': now,
-      },
-    );
+    final flowerRowId = await txn.insert('user_flowers', {
+      'user_id': userId,
+      'seed_id': seedId,
+      'flower_id': flowerId,
+      'growth_value': initialGrowthValue,
+      'stage': initialStage,
+      'is_active': 1,
+      'is_bloomed': 0,
+      'acquired_at': now,
+      'bloomed_at': null,
+      'updated_at': now,
+    });
 
     final usedCount = await txn.update(
       'seed_inventory',
@@ -1136,7 +1095,7 @@ class DatabaseService {
   }
 
   Future<Map<String, int>> getBloomCounts(String userId) async {
-    final db = await database;
+    final db = await _executor;
     final rows = await db.rawQuery(
       '''
       SELECT flower_id, COUNT(*) AS count
@@ -1165,32 +1124,26 @@ class DatabaseService {
     required String batchHash,
     required String growthMetric,
   }) async {
-    final db = await database;
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
-    return db.insert(
-      'import_batches',
-      {
-        'user_id': userId,
-        'batch_hash': batchHash,
-        'growth_metric': growthMetric,
-        'growth_value': 0,
-        'record_count': 0,
-        'unique_address_count': 0,
-        'checkpoint_count': 0,
-        'interaction_count': 0,
-        'status': 'processing',
-        'created_at': now,
-        'completed_at': null,
-      },
-      conflictAlgorithm: ConflictAlgorithm.abort,
-    );
+    return db.insert('import_batches', {
+      'user_id': userId,
+      'batch_hash': batchHash,
+      'growth_metric': growthMetric,
+      'growth_value': 0,
+      'record_count': 0,
+      'unique_address_count': 0,
+      'checkpoint_count': 0,
+      'interaction_count': 0,
+      'status': 'processing',
+      'created_at': now,
+      'completed_at': null,
+    }, conflictAlgorithm: ConflictAlgorithm.abort);
   }
 
-  Future<Map<String, Object?>?> getImportBatchByHash(
-    String batchHash,
-  ) async {
-    final db = await database;
+  Future<Map<String, Object?>?> getImportBatchByHash(String batchHash) async {
+    final db = await _executor;
     final rows = await db.query(
       'import_batches',
       where: 'batch_hash = ?',
@@ -1202,7 +1155,7 @@ class DatabaseService {
   }
 
   Future<Map<String, Object?>?> getImportBatchById(int batchId) async {
-    final db = await database;
+    final db = await _executor;
     final rows = await db.query(
       'import_batches',
       where: 'id = ?',
@@ -1221,7 +1174,7 @@ class DatabaseService {
     required int checkpointCount,
     required int interactionCount,
   }) async {
-    final db = await database;
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
     final count = await db.update(
@@ -1240,35 +1193,26 @@ class DatabaseService {
     );
 
     if (count != 1) {
-      throw Exception(
-        'Import Batchの完了更新に失敗しました。\nbatch_id: $batchId',
-      );
+      throw Exception('Import Batchの完了更新に失敗しました。\nbatch_id: $batchId');
     }
   }
 
-  Future<void> failImportBatch({
-    required int batchId,
-  }) async {
-    final db = await database;
+  Future<void> failImportBatch({required int batchId}) async {
+    final db = await _executor;
     final count = await db.update(
       'import_batches',
-      {
-        'status': 'failed',
-        'completed_at': DateTime.now().toIso8601String(),
-      },
+      {'status': 'failed', 'completed_at': DateTime.now().toIso8601String()},
       where: 'id = ?',
       whereArgs: [batchId],
     );
 
     if (count != 1) {
-      throw Exception(
-        'Import Batchの失敗更新に失敗しました。\nbatch_id: $batchId',
-      );
+      throw Exception('Import Batchの失敗更新に失敗しました。\nbatch_id: $batchId');
     }
   }
 
   Future<List<Map<String, Object?>>> getImportBatches(String userId) async {
-    final db = await database;
+    final db = await _executor;
     return db.query(
       'import_batches',
       where: 'user_id = ?',
@@ -1281,7 +1225,7 @@ class DatabaseService {
     required String userId,
     required String fileHash,
   }) async {
-    final db = await database;
+    final db = await _executor;
     final rows = await db.query(
       'log_archive',
       columns: ['id'],
@@ -1300,7 +1244,7 @@ class DatabaseService {
     required String? rawContent,
     required int recordCount,
   }) async {
-    final db = await database;
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
     final existing = await db.query(
@@ -1315,29 +1259,23 @@ class DatabaseService {
       return (existing.first['id'] as num).toInt();
     }
 
-    return db.insert(
-      'log_archive',
-      {
-        'user_id': userId,
-        'batch_id': batchId,
-        'file_name': fileName,
-        'file_hash': fileHash,
-        'raw_content': rawContent,
-        'record_count': recordCount,
-        'processed': 0,
-        'processed_at': null,
-        'deleted_from_tag': 0,
-        'deleted_at': null,
-        'created_at': now,
-      },
-      conflictAlgorithm: ConflictAlgorithm.abort,
-    );
+    return db.insert('log_archive', {
+      'user_id': userId,
+      'batch_id': batchId,
+      'file_name': fileName,
+      'file_hash': fileHash,
+      'raw_content': rawContent,
+      'record_count': recordCount,
+      'processed': 0,
+      'processed_at': null,
+      'deleted_from_tag': 0,
+      'deleted_at': null,
+      'created_at': now,
+    }, conflictAlgorithm: ConflictAlgorithm.abort);
   }
 
-  Future<void> markLogProcessed({
-    required int logArchiveId,
-  }) async {
-    final db = await database;
+  Future<void> markLogProcessed({required int logArchiveId}) async {
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
     final count = await db.update(
@@ -1356,7 +1294,7 @@ class DatabaseService {
   }
 
   Future<void> markBatchLogsProcessed(int batchId) async {
-    final db = await database;
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
     await db.update(
@@ -1367,10 +1305,8 @@ class DatabaseService {
     );
   }
 
-  Future<void> markLogDeletedFromTag({
-    required int logArchiveId,
-  }) async {
-    final db = await database;
+  Future<void> markLogDeletedFromTag({required int logArchiveId}) async {
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
     final count = await db.update(
@@ -1392,7 +1328,7 @@ class DatabaseService {
     required String userId,
     required String fileHash,
   }) async {
-    final db = await database;
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
     await db.update(
@@ -1404,7 +1340,7 @@ class DatabaseService {
   }
 
   Future<List<Map<String, Object?>>> getLogArchive(String userId) async {
-    final db = await database;
+    final db = await _executor;
     return db.query(
       'log_archive',
       where: 'user_id = ?',
@@ -1427,31 +1363,28 @@ class DatabaseService {
       _validateFlowerId(flowerId);
     }
 
-    final db = await database;
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
-    return db.insert(
-      'result_events',
-      {
-        'user_id': userId,
-        'batch_id': batchId,
-        'event_type': eventType,
-        'flower_id': flowerId,
-        'growth_value': growthValue,
-        'stage_before': stageBefore,
-        'stage_after': stageAfter,
-        'message': message,
-        'displayed': 0,
-        'created_at': now,
-        'displayed_at': null,
-      },
-    );
+    return db.insert('result_events', {
+      'user_id': userId,
+      'batch_id': batchId,
+      'event_type': eventType,
+      'flower_id': flowerId,
+      'growth_value': growthValue,
+      'stage_before': stageBefore,
+      'stage_after': stageAfter,
+      'message': message,
+      'displayed': 0,
+      'created_at': now,
+      'displayed_at': null,
+    });
   }
 
   Future<List<Map<String, Object?>>> getPendingResultEvents(
     String userId,
   ) async {
-    final db = await database;
+    final db = await _executor;
     return db.query(
       'result_events',
       where: 'user_id = ? AND displayed = 0',
@@ -1461,7 +1394,7 @@ class DatabaseService {
   }
 
   Future<void> markResultEventDisplayed(int eventId) async {
-    final db = await database;
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
     final count = await db.update(
@@ -1472,14 +1405,12 @@ class DatabaseService {
     );
 
     if (count != 1) {
-      throw Exception(
-        '結果イベントの表示済み更新に失敗しました。\nevent_id: $eventId',
-      );
+      throw Exception('結果イベントの表示済み更新に失敗しました。\nevent_id: $eventId');
     }
   }
 
   Future<void> markBatchResultEventsDisplayed(int batchId) async {
-    final db = await database;
+    final db = await _executor;
     final now = DateTime.now().toIso8601String();
 
     await db.update(
@@ -1491,12 +1422,10 @@ class DatabaseService {
   }
 
   Future<Map<String, int>> getDebugCounts() async {
-    final db = await database;
+    final db = await _executor;
 
     Future<int> count(String table) async {
-      final result = await db.rawQuery(
-        'SELECT COUNT(*) AS count FROM $table',
-      );
+      final result = await db.rawQuery('SELECT COUNT(*) AS count FROM $table');
       return (result.first['count'] as num?)?.toInt() ?? 0;
     }
 

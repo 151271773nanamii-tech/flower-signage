@@ -14,7 +14,7 @@
     "disconnect_miss_threshold": 3
   },
   "log": {
-    "delete_after_success": false,
+    "delete_after_success": true,
     "delete_processed_logs": false
   },
   "debug": {
